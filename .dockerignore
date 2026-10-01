@@ -1,0 +1,31 @@
+# ---------------------------------------------------------------------------
+# Keep local databases and credentials out of the image and out of git.
+# ---------------------------------------------------------------------------
+
+.env
+.env.*
+!.env.example
+*.env
+
+# Database volumes and dumps. A persistent production database must never be
+# baked into an image or committed to a repository.
+data/
+backend/data/
+backend/backups/
+*.mongodump
+*.archive
+dump.rdb
+
+# Build output
+node_modules/
+frontend/build/
+backend/__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+test_reports/
+
+# Editor / OS noise
+.idea/
+.vscode/
+.DS_Store

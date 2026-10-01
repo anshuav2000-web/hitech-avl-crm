@@ -1,0 +1,28 @@
+# ---------------------------------------------------------------------------
+# `COPY . .` in the frontend Dockerfile must not drag a multi-hundred-megabyte
+# local node_modules into the build stage, and must never bake a local .env
+# (with a localhost API URL) into the bundle.
+# ---------------------------------------------------------------------------
+
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Produced by the image's own build step
+build/
+
+# Local env files — REACT_APP_* values come from build args / env in production
+.env
+.env.*
+*.env
+
+# Tests and coverage
+coverage/
+src/**/*.test.js
+src/**/*.test.jsx
+
+# Editor / OS noise
+.idea/
+.vscode/
+.DS_Store

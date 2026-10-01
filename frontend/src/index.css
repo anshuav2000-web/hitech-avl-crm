@@ -1,0 +1,303 @@
+@import url('https://api.fontshare.com/v2/css?f[]=cabinet-grotesk@700,800,900&f[]=satoshi@400,500,600,700&display=swap');
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ---------- Base ---------- */
+body {
+  margin: 0;
+  font-family: 'Satoshi', ui-sans-serif, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background: #FFFFFF;
+  color: #0F172A;
+}
+
+.font-display {
+  font-family: 'Cabinet Grotesk', 'Satoshi', sans-serif;
+  letter-spacing: -0.02em;
+}
+
+.label-eyebrow {
+  font-size: 0.65rem;
+  font-weight: 800;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: #0284C7;
+}
+
+/* ---------- Scrollbar ---------- */
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+::-webkit-scrollbar { width: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #CBD5E1; border-radius: 9999px; }
+::-webkit-scrollbar-thumb:hover { background: #94A3B8; }
+
+/* ---------- Grain Texture Overlay ---------- */
+.grain::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 9999;
+  opacity: 0.025;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E");
+  background-repeat: repeat;
+  background-size: 256px 256px;
+}
+
+/* ---------- Gradient Mesh Backgrounds ---------- */
+.mesh-gradient {
+  position: relative;
+  overflow: hidden;
+}
+.mesh-gradient::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(ellipse 80% 60% at 10% 0%, rgba(2,132,199,0.06) 0%, transparent 60%),
+    radial-gradient(ellipse 60% 50% at 90% 100%, rgba(99,102,241,0.04) 0%, transparent 60%),
+    radial-gradient(ellipse 50% 40% at 50% 50%, rgba(251,191,36,0.02) 0%, transparent 60%);
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* ---------- Diagonal Accent ---------- */
+.diagonal-accent {
+  position: relative;
+}
+.diagonal-accent::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 40%;
+  height: 100%;
+  background: linear-gradient(135deg, rgba(2,132,199,0.03) 0%, transparent 60%);
+  clip-path: polygon(20% 0%, 100% 0%, 100% 100%, 0% 100%);
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* ---------- Brand Background ---------- */
+.brand-bg {
+  position: relative;
+  overflow-x: hidden;
+  background: #FFFFFF;
+}
+.brand-bg::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(ellipse 90% 60% at 15% -10%, rgba(2,132,199,0.04) 0%, transparent 65%),
+    radial-gradient(ellipse 70% 50% at 85% 105%, rgba(99,102,241,0.03) 0%, transparent 65%);
+  pointer-events: none;
+  z-index: 0;
+}
+.brand-bg::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(15,23,42,0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(15,23,42,0.03) 1px, transparent 1px);
+  background-size: 48px 48px;
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* ---------- Grid Background for Login Hero ---------- */
+.grid-bg {
+  background-image:
+    linear-gradient(rgba(255,255,255,0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,0.04) 1px, transparent 1px);
+  background-size: 48px 48px;
+}
+
+/* ---------- Design Tokens ---------- */
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 222.2 84% 4.9%;
+    --card: 0 0% 100%;
+    --card-foreground: 222.2 84% 4.9%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222.2 84% 4.9%;
+    --primary: 199 89% 48%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 210 40% 96.1%;
+    --secondary-foreground: 222.2 47.4% 11.2%;
+    --muted: 210 40% 96.1%;
+    --muted-foreground: 215.4 16.3% 46.9%;
+    --accent: 210 40% 96.1%;
+    --accent-foreground: 222.2 47.4% 11.2%;
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 214.3 31.8% 91.4%;
+    --input: 214.3 31.8% 91.4%;
+    --ring: 199 89% 48%;
+    --radius: 0.75rem;
+    --glass-bg: 255 255 255 / 0.95;
+    --glass-border: 226 232 240;
+    --glass-shadow: 0 10px 30px -5px rgba(0, 0, 0, 0.05);
+    --accent-warm: 30 80% 55%;
+    --accent-warm-foreground: 0 0% 100%;
+  }
+}
+
+* { @apply border-border; }
+body { @apply bg-background text-foreground; }
+
+/* ---------- Glass & Card Utilities ---------- */
+.glass {
+  background: #FFFFFF;
+  border: 1px solid #E2E8F0;
+  box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.05);
+}
+
+.glass-card {
+  @apply bg-white border border-slate-200 rounded-xl p-6 transition-all duration-200 hover:border-sky-500/40 hover:shadow-lg;
+  position: relative;
+  z-index: 1;
+}
+
+/* ---------- Staggered Reveal Animations ---------- */
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.animate-fade-up { animation: fade-up 0.45s ease-out both; }
+
+@keyframes scale-in {
+  from { opacity: 0; transform: scale(0.96); }
+  to   { opacity: 1; transform: scale(1); }
+}
+.animate-scale-in { animation: scale-in 0.3s ease-out both; }
+
+@keyframes slide-in-left {
+  from { opacity: 0; transform: translateX(-16px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+.animate-slide-in-left { animation: slide-in-left 0.4s ease-out both; }
+
+@keyframes slide-in-right {
+  from { opacity: 0; transform: translateX(16px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+.animate-slide-in-right { animation: slide-in-right 0.4s ease-out both; }
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.animate-shimmer {
+  background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.4) 50%, transparent 100%);
+  background-size: 200% 100%;
+  animation: shimmer 2s ease-in-out infinite;
+}
+
+/* Stagger children */
+.stagger-children > * {
+  opacity: 0;
+  animation: fade-up 0.4s ease-out both;
+}
+.stagger-children > *:nth-child(1) { animation-delay: 0.03s; }
+.stagger-children > *:nth-child(2) { animation-delay: 0.06s; }
+.stagger-children > *:nth-child(3) { animation-delay: 0.09s; }
+.stagger-children > *:nth-child(4) { animation-delay: 0.12s; }
+.stagger-children > *:nth-child(5) { animation-delay: 0.15s; }
+.stagger-children > *:nth-child(6) { animation-delay: 0.18s; }
+.stagger-children > *:nth-child(7) { animation-delay: 0.21s; }
+.stagger-children > *:nth-child(8) { animation-delay: 0.24s; }
+.stagger-children > *:nth-child(9) { animation-delay: 0.27s; }
+.stagger-children > *:nth-child(10) { animation-delay: 0.30s; }
+
+/* Scroll-triggered reveal */
+.reveal {
+  opacity: 0;
+  transform: translateY(16px);
+  transition: opacity 0.5s ease-out, transform 0.5s ease-out;
+}
+.reveal.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* ---------- Card Lift ---------- */
+.card-lift {
+  transition: transform 0.18s ease, box-shadow 0.18s ease;
+}
+.card-lift:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px -6px rgba(0, 0, 0, 0.08);
+}
+
+/* ---------- KPI Card Pulse ---------- */
+.kpi-icon {
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+.kpi-card:hover .kpi-icon {
+  transform: scale(1.08);
+  box-shadow: 0 0 0 4px rgba(2,132,199,0.1);
+}
+
+/* ---------- Subtle Row Hover ---------- */
+tbody tr { transition: background-color 0.12s ease; }
+
+/* ---------- Smooth Input Focus ---------- */
+input:focus, select:focus, textarea:focus {
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+/* ---------- Focus Ring ---------- */
+.focus-ring {
+  @apply focus:outline-none focus:ring-2 focus:ring-sky-500/20 focus:ring-offset-2 focus:ring-offset-white;
+}
+
+/* ---------- Button Micro-interactions ---------- */
+.btn-primary {
+  @apply bg-sky-600 text-white font-bold rounded-xl px-5 py-2.5 shadow-md shadow-sky-600/15 transition-all duration-200 hover:bg-sky-500 hover:shadow-lg hover:shadow-sky-600/20 active:scale-[0.98];
+}
+.btn-secondary {
+  @apply bg-white border border-slate-200 text-slate-900 font-bold rounded-xl px-5 py-2.5 shadow-sm transition-all duration-200 hover:bg-slate-50 hover:border-slate-300 active:scale-[0.98];
+}
+.btn-ghost {
+  @apply bg-transparent text-slate-700 font-bold rounded-xl px-4 py-2 transition-all duration-200 hover:bg-slate-100 active:scale-[0.98];
+}
+
+/* ---------- Badge Pulse ---------- */
+.badge-live {
+  position: relative;
+}
+.badge-live::after {
+  content: '';
+  position: absolute;
+  top: -1px;
+  right: -1px;
+  width: 6px;
+  height: 6px;
+  border-radius: 9999px;
+  background: #0284C7;
+  animation: pulse-dot 2s ease-in-out infinite;
+}
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.5; transform: scale(1.5); }
+}
+
+/* ---------- Divider Accent ---------- */
+.divider-accent {
+  border: none;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, #E2E8F0, transparent);
+}
+
+/* ---------- Text Selection ---------- */
+::selection {
+  background: rgba(2,132,199,0.15);
+  color: #0F172A;
+}

@@ -1,0 +1,33 @@
+# ---------------------------------------------------------------------------
+# Keep local state, credentials and caches out of the production image.
+# `COPY . .` in the Dockerfile must only ever bring in application code,
+# the bundled fonts/ and the seed_data/ XLSX files.
+# ---------------------------------------------------------------------------
+
+# Credentials — supplied as container environment variables in production.
+.env
+.env.*
+*.env
+!.env.example
+
+# Local database state and pre-migration backups
+data/
+backups/
+*.mongodump
+*.archive
+dump.rdb
+mongod.log
+
+# Caches and local artefacts
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+tests/
+
+# Editor / OS noise
+.idea/
+.vscode/
+.DS_Store

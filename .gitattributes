@@ -1,0 +1,14 @@
+# Normalise line endings in the repository so the Docker builds on Linux always
+# see LF, regardless of who committed from which platform.
+* text=auto eol=lf
+
+# Binary assets: never touch.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.ttf binary
+*.xlsx binary
+*.zip binary
+*.gz binary
