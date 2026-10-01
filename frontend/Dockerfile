@@ -14,9 +14,12 @@ ENV REACT_APP_BACKEND_URL=$REACT_APP_BACKEND_URL
 ENV GENERCI_SKIP_AUTOINSTALL=true
 
 COPY package.json package-lock.json* ./
-# `npm ci` uses the lockfile and fails loudly on drift; fall back to `npm install`
-# only when no lockfile was committed.
-RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
+# `--legacy-peer-deps` is required, not a shortcut: the committed lockfile pins
+# date-fns@4 while react-day-picker@8 declares a peer range of ^2.28 || ^3, so a
+# plain `npm ci` aborts with ERESOLVE. date-fns is not imported anywhere in
+# src/, and the app was developed and tested against the pinned versions, so
+# relaxing the peer check keeps the exact dependency tree the lockfile records.
+RUN if [ -f package-lock.json ]; then npm ci --legacy-peer-deps; else npm install --legacy-peer-deps; fi
 
 COPY . .
 RUN npm run build
