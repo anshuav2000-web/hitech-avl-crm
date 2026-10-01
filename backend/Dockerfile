@@ -30,8 +30,10 @@ USER crm
 EXPOSE 8000
 
 # Container health: the endpoint pings MongoDB, so a green result means the API can
-# actually serve traffic, not merely that the process is alive.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+# actually serve traffic, not merely that the process is alive. The first boot
+# runs every pending migration before the worker starts accepting requests, so the
+# start period is generous and a slow seed is never mistaken for a broken app.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=10 \
   CMD curl -fsS http://127.0.0.1:8000/health || exit 1
 
 # Production process. Never `uvicorn --reload`, and never the dev server.

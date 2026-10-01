@@ -104,8 +104,7 @@ services:
         REACT_APP_BACKEND_URL: ${REACT_APP_BACKEND_URL:-}
     restart: unless-stopped
     depends_on:
-      backend:
-        condition: service_healthy
+      - backend
     ports:
       # The single public entry point. Point the Coolify domain here.
       - "${FRONTEND_PORT:-3080}:80"
