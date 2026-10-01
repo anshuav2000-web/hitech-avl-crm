@@ -3322,10 +3322,20 @@ async def ai_summary(lead_id: str, user: dict = Depends(get_current_user)):
 # AI summary endpoint also does NOT include catalog data in its context.
 
 def _allowed_brands(user: dict) -> Optional[List[str]]:
-    """Returns None for admin (all access), or list of allowed brand names for sales."""
+    """Return ``None`` for unrestricted access, else the allowed brand names.
+
+    A user with no allow-list is unrestricted, exactly like an admin. An empty
+    list previously meant "no brands at all", which made every dropdown in the
+    app render empty for the whole team -- a user created without picking brands,
+    or a legacy row backfilled to ``[]``, could not select a brand anywhere.
+
+    Restriction is therefore only ever expressed by a non-empty list. Use an
+    explicit sentinel (a list containing no real brand is not expressible today)
+    if a "sees nothing" user is ever needed.
+    """
     if user.get("role") == "admin":
         return None
-    return user.get("allowed_brands") or []
+    return user.get("allowed_brands") or None
 
 @api.get("/brands")
 async def list_brands(user: dict = Depends(get_current_user),
@@ -4281,6 +4291,8 @@ async def create_brand_request(payload: BrandAccessRequestCreate, user: dict = D
         raise HTTPException(status_code=400, detail="A pending request already exists for this brand")
     if payload.brand in (user.get("allowed_brands") or []):
         raise HTTPException(status_code=400, detail="You already have access to this brand")
+    if not (user.get("allowed_brands") or []):
+        raise HTTPException(status_code=400, detail="You already have access to every brand")
     req = {
         "id": str(uuid.uuid4()),
         "user_id": user["id"],
@@ -4320,10 +4332,15 @@ async def act_brand_request(req_id: str, payload: dict, _: dict = Depends(requir
         "actioned_at": datetime.now(timezone.utc).isoformat(),
     }})
     if action == "approve":
-        await db.users.update_one(
-            {"id": req["user_id"]},
-            {"$addToSet": {"allowed_brands": req["brand"]}},
-        )
+        target = await db.users.find_one({"id": req["user_id"]}, {"allowed_brands": 1})
+        # A user with no allow-list is unrestricted already (see _allowed_brands).
+        # $addToSet would silently turn them into a one-brand user, so only
+        # extend a list that actually restricts them.
+        if (target.get("allowed_brands") or []):
+            await db.users.update_one(
+                {"id": req["user_id"]},
+                {"$addToSet": {"allowed_brands": req["brand"]}},
+            )
     return await db.brand_requests.find_one({"id": req_id}, {"_id": 0})
 
 # ---------- Webhook Settings ----------
