@@ -58,6 +58,7 @@ CONFIG_COLLECTION = "crm_config_sets"
 # build, which took the whole API down. One worker wins this lease and migrates;
 # the others wait for it and then continue.
 LOCK_ID = "__runner_lock__"
+LOCK_COLLECTION = "schema_migration_lock"
 LOCK_TTL_SECONDS = 900
 
 
@@ -67,6 +68,12 @@ def _now() -> str:
 
 def _uid() -> str:
     return str(uuid.uuid4())
+
+
+async def _recorded_migration_ids(db) -> set:
+    """Ids of migrations already applied. A row without an ``id`` is not one."""
+    rows = await db[MIGRATIONS_COLLECTION].find({}, {"_id": 0, "id": 1}).to_list(500)
+    return {r["id"] for r in rows if r.get("id")}
 
 
 # ---------------------------------------------------------------------------
@@ -544,7 +551,7 @@ async def _acquire_runner_lock(db, owner: str) -> bool:
     """Try to become the single migration runner. True when the lease was taken."""
     now = datetime.now(timezone.utc)
     try:
-        doc = await db[MIGRATIONS_COLLECTION].find_one_and_update(
+        doc = await db[LOCK_COLLECTION].find_one_and_update(
             # Matches only an absent lock or one whose lease has expired, so a live
             # lease can never be stolen. The upsert trips the unique _id index and
             # raises DuplicateKeyError when another worker already holds it.
@@ -564,7 +571,7 @@ async def _acquire_runner_lock(db, owner: str) -> bool:
 
 async def _release_runner_lock(db, owner: str) -> None:
     try:
-        await db[MIGRATIONS_COLLECTION].delete_one({"_id": LOCK_ID, "owner": owner})
+        await db[LOCK_COLLECTION].delete_one({"_id": LOCK_ID, "owner": owner})
     except Exception:  # noqa: BLE001 - a stale lease is harmless, it just expires
         pass
 
@@ -579,10 +586,7 @@ async def _wait_for_other_runner(db, log, timeout: float = LOCK_TTL_SECONDS) -> 
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     while loop.time() < deadline:
-        recorded = await db[MIGRATIONS_COLLECTION].find(
-            {}, {"_id": 0, "id": 1}
-        ).to_list(500)
-        if wanted <= {d["id"] for d in recorded}:
+        if wanted <= await _recorded_migration_ids(db):
             return
         await asyncio.sleep(1.0)
     log("migration lease is held by another worker and did not clear in time; continuing")
@@ -605,7 +609,7 @@ async def run_migrations(db, log=None) -> list[str]:
         return []
 
     try:
-        done = {d["id"] for d in await db[MIGRATIONS_COLLECTION].find({}, {"_id": 0, "id": 1}).to_list(500)}
+        done = await _recorded_migration_ids(db)
 
         for mid, name, fn in MIGRATIONS:
             if mid in done:
