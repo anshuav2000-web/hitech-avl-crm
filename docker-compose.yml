@@ -6,7 +6,7 @@
 # its own database volume.
 #
 # Request flow:
-#   Internet → Coolify (Traefik) → frontend nginx  :8080
+#   Internet → Coolify (Traefik) → frontend nginx   :80  (host port 3080)
 #                              → /api/* proxied to backend :8000
 #                              → backend → mongo :27017
 #
@@ -85,11 +85,12 @@ services:
       META_APP_ID: ${META_APP_ID:-}
       META_APP_SECRET: ${META_APP_SECRET:-}
       META_PAGE_ID: ${META_PAGE_ID:-}
-    ports:
-      # Published so Coolify can optionally attach a second domain to the API
-      # and so `/health` is reachable for platform-level checks. Remove this
-      # block entirely if you never want the API directly reachable.
-      - "${BACKEND_PORT:-8000}:8000"
+    # Not published to the host. The frontend's nginx proxies /api/* to the
+    # backend over the internal network, so the API needs no public port of its
+    # own — which also avoids colliding with the ports other apps on this host
+    # already bind.
+    expose:
+      - "8000"
 
   # ---------- Frontend ----------
   frontend:
@@ -107,7 +108,7 @@ services:
         condition: service_healthy
     ports:
       # The single public entry point. Point the Coolify domain here.
-      - "${FRONTEND_PORT:-8080}:80"
+      - "${FRONTEND_PORT:-3080}:80"
     environment:
       # Resolved into nginx.conf at container start by the image's envsubst.
       BACKEND_HOST: backend
