@@ -78,6 +78,28 @@ cd backend && python -m migrations
 The same runner executes at application startup, so a new deploy applies any
 pending migration before serving traffic.
 
+### Migration runner concurrency
+
+`uvicorn` runs two workers, so startup triggers the migration runner twice
+concurrently. `run_migrations()` takes a MongoDB lease before applying anything:
+
+- the lease is a document in the `schema_migration_lock` collection, written with
+  an upsert whose filter requires the existing lease to be expired, so the unique
+  `_id` decides the winner;
+- the losing worker waits (up to `LOCK_TTL_SECONDS`) until every migration is
+  recorded before continuing, so a worker never builds indexes against a
+  half-migrated database;
+- the lease is released as soon as the runner finishes.
+
+Keep the lease in its own collection. It lives beside the migration records only
+by accident, and a lease document has no `id` field, so the reader that builds
+the "already applied" set raises `KeyError` and silently skips the entire
+migration chain.
+
+Seed migrations must also be idempotent — use an upsert with `$setOnInsert`
+rather than `insert_one`, or a re-run against a partially seeded database trips
+the unique index.
+
 ## Database engine note
 
 The application is MongoDB-native: every endpoint queries documents through Motor,
