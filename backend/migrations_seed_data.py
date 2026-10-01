@@ -275,20 +275,26 @@ async def m012_seed_demo_employees(db):
     added = 0
     for name, local, role, department, designation in DEMO_EMPLOYEES:
         email = f"demo-{local}@{DEMO_EMAIL_DOMAIN}"
-        if await db.users.find_one({"email": email}, {"_id": 0, "id": 1}):
-            continue
-        await db.users.insert_one({
-            "id": _sid(), "name": name, "email": email, "role": role,
-            "department": department, "designation": designation,
-            "phone": None, "allowed_brands": [], "active": True,
-            # Loud, machine-checkable markers so these are never mistaken for staff and
-            # can be purged with a single query before go-live.
-            "is_demo": True,
-            "demo_note": "Fictional demo account seeded by m012. Replace or purge before go-live.",
-            "password_hash": _demo_hash(),
-            "created_at": now,
-        })
-        added += 1
+        # A single atomic upsert, not find_one-then-insert: two uvicorn workers
+        # starting together would both pass the existence check and insert the
+        # same address, which then breaks the unique email index below.
+        result = await db.users.update_one(
+            {"email": email},
+            {"$setOnInsert": {
+                "id": _sid(), "name": name, "email": email, "role": role,
+                "department": department, "designation": designation,
+                "phone": None, "allowed_brands": [], "active": True,
+                # Loud, machine-checkable markers so these are never mistaken for
+                # staff and can be purged with a single query before go-live.
+                "is_demo": True,
+                "demo_note": "Fictional demo account seeded by m012. Replace or purge before go-live.",
+                "password_hash": _demo_hash(),
+                "created_at": now,
+            }},
+            upsert=True,
+        )
+        if result.upserted_id:
+            added += 1
 
     # Unique only when present. m013 imports staff who have no email address, and a
     # plain unique index would reject the second missing-email row as a duplicate.

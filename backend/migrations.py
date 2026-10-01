@@ -22,8 +22,11 @@ import asyncio
 import os
 import sys
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
 # Catalogue and demo-team seeding lives in its own module because the data tables are
 # long and want their rationale documented next to them.
@@ -46,6 +49,16 @@ ROOT_DIR = Path(__file__).parent
 MIGRATIONS_COLLECTION = "schema_migrations"
 SETTINGS_COLLECTION = "settings"
 CONFIG_COLLECTION = "crm_config_sets"
+
+# Cross-process migration lock. uvicorn runs several workers and each of them
+# executes the FastAPI startup hook in its own process, so on a cold database two
+# workers reach run_migrations() at the same instant. The seed migrations are
+# idempotent one at a time but not simultaneously -- their check-then-insert steps
+# raced, produced duplicate user rows, and the unique email index then failed to
+# build, which took the whole API down. One worker wins this lease and migrates;
+# the others wait for it and then continue.
+LOCK_ID = "__runner_lock__"
+LOCK_TTL_SECONDS = 900
 
 
 def _now() -> str:
@@ -527,6 +540,54 @@ MIGRATIONS = [
 # Runner
 # ---------------------------------------------------------------------------
 
+async def _acquire_runner_lock(db, owner: str) -> bool:
+    """Try to become the single migration runner. True when the lease was taken."""
+    now = datetime.now(timezone.utc)
+    try:
+        doc = await db[MIGRATIONS_COLLECTION].find_one_and_update(
+            # Matches only an absent lock or one whose lease has expired, so a live
+            # lease can never be stolen. The upsert trips the unique _id index and
+            # raises DuplicateKeyError when another worker already holds it.
+            {"_id": LOCK_ID, "expires_at": {"$lte": now}},
+            {"$set": {
+                "owner": owner,
+                "acquired_at": now.isoformat(),
+                "expires_at": now + timedelta(seconds=LOCK_TTL_SECONDS),
+            }},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+    except DuplicateKeyError:
+        return False
+    return bool(doc) and doc.get("owner") == owner
+
+
+async def _release_runner_lock(db, owner: str) -> None:
+    try:
+        await db[MIGRATIONS_COLLECTION].delete_one({"_id": LOCK_ID, "owner": owner})
+    except Exception:  # noqa: BLE001 - a stale lease is harmless, it just expires
+        pass
+
+
+async def _wait_for_other_runner(db, log, timeout: float = LOCK_TTL_SECONDS) -> None:
+    """Block until every migration is recorded as applied by whoever held the lease.
+
+    Waiting rather than skipping matters: a worker that returned early would go on
+    to build indexes against a half-migrated database.
+    """
+    wanted = {mid for mid, _name, _fn in MIGRATIONS}
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        recorded = await db[MIGRATIONS_COLLECTION].find(
+            {}, {"_id": 0, "id": 1}
+        ).to_list(500)
+        if wanted <= {d["id"] for d in recorded}:
+            return
+        await asyncio.sleep(1.0)
+    log("migration lease is held by another worker and did not clear in time; continuing")
+
+
 async def run_migrations(db, log=None) -> list[str]:
     """Apply any migration not yet recorded in schema_migrations.
 
@@ -536,30 +597,40 @@ async def run_migrations(db, log=None) -> list[str]:
     applied: list[str] = []
 
     await db[MIGRATIONS_COLLECTION].create_index("id", unique=True, background=True)
-    done = {d["id"] for d in await db[MIGRATIONS_COLLECTION].find({}, {"_id": 0, "id": 1}).to_list(500)}
 
-    for mid, name, fn in MIGRATIONS:
-        if mid in done:
-            continue
-        try:
-            await fn(db)
-        except Exception as exc:  # noqa: BLE001 - a failed migration must not brick startup
-            log(f"MIGRATION FAILED {mid}_{name}: {exc}")
-            raise
-        await db[MIGRATIONS_COLLECTION].update_one(
-            {"id": mid},
-            {
-                "$setOnInsert": {
-                    "id": mid,
-                    "name": name,
-                    "applied_at": _now(),
-                    "status": "applied",
-                }
-            },
-            upsert=True,
-        )
-        applied.append(mid)
-        log(f"migrated {mid}_{name}")
+    owner = _uid()
+    if not await _acquire_runner_lock(db, owner):
+        log("another worker holds the migration lease; waiting for it to finish")
+        await _wait_for_other_runner(db, log)
+        return []
+
+    try:
+        done = {d["id"] for d in await db[MIGRATIONS_COLLECTION].find({}, {"_id": 0, "id": 1}).to_list(500)}
+
+        for mid, name, fn in MIGRATIONS:
+            if mid in done:
+                continue
+            try:
+                await fn(db)
+            except Exception as exc:  # noqa: BLE001 - a failed migration must not brick startup
+                log(f"MIGRATION FAILED {mid}_{name}: {exc}")
+                raise
+            await db[MIGRATIONS_COLLECTION].update_one(
+                {"id": mid},
+                {
+                    "$setOnInsert": {
+                        "id": mid,
+                        "name": name,
+                        "applied_at": _now(),
+                        "status": "applied",
+                    }
+                },
+                upsert=True,
+            )
+            applied.append(mid)
+            log(f"migrated {mid}_{name}")
+    finally:
+        await _release_runner_lock(db, owner)
 
     # Record the schema version in the pre-existing settings collection.
     await db[SETTINGS_COLLECTION].update_one(

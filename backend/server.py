@@ -6841,26 +6841,32 @@ async def on_start():
     except Exception as exc:  # noqa: BLE001
         logger.error("Migration run failed: %s", exc)
 
+    # Index creation must never take the API down. A duplicate or incompatible
+    # index is a data problem to be reported and fixed, not a reason to refuse all
+    # traffic; the process used to exit here and Docker then crash-looped.
+    async def _ensure_index(collection: str, keys, **kwargs) -> None:
+        try:
+            await db[collection].create_index(keys, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Index %s on %s could not be created: %s", keys, collection, exc)
+
     # Partial, not plain, unique: the staff directory imports people who have no email
     # address yet. A plain unique index treats every missing value as the same value
     # and rejects the second such row outright.
-    await db.users.create_index(
-        "email",
-        unique=True,
-        partialFilterExpression={"email": {"$type": "string"}},
-    )
-    await db.users.create_index("id", unique=True)
-    await db.leads.create_index("id", unique=True)
-    await db.leads.create_index("assigned_to")
-    await db.leads.create_index("stage")
-    await db.activities.create_index("lead_id")
-    await db.quotations.create_index("lead_id")
-    await db.webhook_settings.create_index("id", unique=True)
-    await db.webhook_logs.create_index("event")
-    await db.webhook_logs.create_index("created_at")
-    await db.resend_settings.create_index("id", unique=True)
-    await db.email_logs.create_index("event")
-    await db.email_logs.create_index("created_at")
+    await _ensure_index("users", "email", unique=True,
+                        partialFilterExpression={"email": {"$type": "string"}})
+    await _ensure_index("users", "id", unique=True)
+    await _ensure_index("leads", "id", unique=True)
+    await _ensure_index("leads", "assigned_to")
+    await _ensure_index("leads", "stage")
+    await _ensure_index("activities", "lead_id")
+    await _ensure_index("quotations", "lead_id")
+    await _ensure_index("webhook_settings", "id", unique=True)
+    await _ensure_index("webhook_logs", "event")
+    await _ensure_index("webhook_logs", "created_at")
+    await _ensure_index("resend_settings", "id", unique=True)
+    await _ensure_index("email_logs", "event")
+    await _ensure_index("email_logs", "created_at")
     # Seed admin from env — falls back to safe defaults ONLY in dev.
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@hitechaudio.in").lower()
     admin_pw_env = os.environ.get("ADMIN_PASSWORD")
