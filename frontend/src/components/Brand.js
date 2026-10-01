@@ -1,23 +1,43 @@
-// Brand assets pulled from www.hitechavl.com CMS
-export const HITECH_LOGO = "https://customer-assets.emergentagent.com/job_db40f655-6e53-4589-a605-467da9dcc230/artifacts/hitech-logo.png";
-// We try the real site logo first; if it fails, fallback to a wordmark
-export const HITECH_LOGO_FALLBACKS = [
-  "https://www.hitechavl.com/img/logo.png",
-  "https://www.hitechavl.com/img/logo.svg",
-  "https://cms.hitechavl.com/files/images/logo.png",
-];
+import { memo } from "react";
 
-export function HitechLogo({ className = "h-9", invert = false }) {
-  return (
-    <div className={`flex items-center gap-2.5`}>
-      <div className={`relative ${className} aspect-square rounded-md flex items-center justify-center font-display font-black text-white`}
-           style={{ background: invert ? "#fff" : "#DC2626", color: invert ? "#DC2626" : "#fff" }}>
-        <span className="text-[11px] tracking-tighter">Hi-T</span>
-      </div>
-      <div className="leading-tight">
-        <div className={`font-display font-bold text-[15px] ${invert ? "text-white" : "text-slate-900"}`}>Hi-Tech</div>
-        <div className={`text-[10px] tracking-[0.18em] font-medium uppercase ${invert ? "text-white/70" : "text-slate-500"}`}>Audio & Image LLP</div>
-      </div>
-    </div>
-  );
-}
+/**
+ * The Hi-Tech Audio & Image logo.
+ *
+ * Primary source is the Google Drive file the business supplied. The bundled
+ * ``public/logo.png`` is the fallback: Drive rate-limits and serves an HTML error
+ * page under load, and an HTML body decoded as an image renders as a broken image
+ * in every header, sidebar and login screen at once. Having a local copy means the
+ * worst case is a slightly older logo, not a blank brand mark.
+ *
+ * The id is the image's public URL, so nothing about the CRM's data is exposed by
+ * loading it -- the same reasoning that makes ``/api/media/{id}`` public.
+ */
+export const HITECH_LOGO =
+  "https://drive.google.com/uc?export=view&id=1680IgbZrG_C1HodFQumzwTt1F6d9qcSv";
+
+const HITECH_LOGO_FALLBACK = "/logo.png";
+
+/**
+ * @param className Height of the mark; width follows the image aspect ratio.
+ * @param invert   Rendered on a dark background (login split panel, coloured hero).
+ *   The logo is dropped behind a light pill rather than recoloured, because
+ *   inverting a raster logo destroys the colours that identify the brand.
+ */
+const HitechLogo = ({ className = "h-9", invert = false }) => (
+  <div className="flex items-center select-none">
+    <img
+      src={HITECH_LOGO}
+      // Cleared before reassignment: without it a failing fallback re-enters
+      // onError and the browser loops the request forever.
+      onError={(e) => {
+        e.currentTarget.onerror = null;
+        e.currentTarget.src = HITECH_LOGO_FALLBACK;
+      }}
+      alt="Hi-Tech Audio & Image LLP"
+      className={`${className} w-auto object-contain ${invert ? "rounded-md bg-white px-1.5 py-1" : ""}`}
+    />
+  </div>
+);
+
+export { HitechLogo };
+export default memo(HitechLogo);

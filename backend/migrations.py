@@ -43,6 +43,15 @@ from migrations_brands import (
     m017_clean_duplicates,
     m018_archive_products_and_merge_categories,
 )
+# Super Admin system: media storage, audit trail, the explicit role registry and the
+# brand/product master fields the Super Admin editor writes.
+from migrations_superadmin import (
+    m019_media_and_audit_indexes,
+    m020_super_admin_role,
+    m021_brand_master_fields,
+    m022_product_media_and_brand_integrity,
+    m023_repair_role_permission_vocabulary,
+)
 
 ROOT_DIR = Path(__file__).parent
 
@@ -540,6 +549,11 @@ MIGRATIONS = [
     ("m016", "add_product_schema", m016_add_product_schema),
     ("m017", "clean_duplicates", m017_clean_duplicates),
     ("m018", "archive_products_and_merge_categories", m018_archive_products_and_merge_categories),
+("m019", "media_and_audit_indexes", m019_media_and_audit_indexes),
+("m020", "super_admin_role", m020_super_admin_role),
+("m021", "brand_master_fields", m021_brand_master_fields),
+    ("m022", "product_media_and_brand_integrity", m022_product_media_and_brand_integrity),
+    ("m023", "repair_role_permission_vocabulary", m023_repair_role_permission_vocabulary),
 ]
 
 

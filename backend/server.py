@@ -23,6 +23,10 @@ from pydantic import BaseModel, Field, EmailStr, ConfigDict
 from io import BytesIO
 from urllib.parse import quote_plus
 
+import audit
+import media as media_store
+import permissions as perms
+
 # ---------- Database ----------
 # The URL may arrive as DATABASE_URL (the conventional production variable name) or
 # MONGO_URL (what the existing local .env uses). Both are read so an existing
@@ -255,11 +259,15 @@ async def get_current_user(request: Request) -> dict:
     user = await db.users.find_one({"id": payload["sub"]})
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
+    if user.get("is_active") is False:
+        # Deactivation has to mean something on every request, not only at login:
+        # an already-issued token would otherwise keep working for its full TTL.
+        raise HTTPException(status_code=401, detail="This account has been deactivated")
     user.pop("password_hash", None)
     user.pop("_id", None)
     return user
 
-ADMIN_ROLE_NAMES = {"admin", "superadmin", "management"}
+ADMIN_ROLE_NAMES = perms.ADMIN_ROLE_NAMES
 
 
 def is_admin_role(user: dict) -> bool:
@@ -269,7 +277,50 @@ def is_admin_role(user: dict) -> bool:
     `superadmin` and `management` as ordinary sales users and hid their data from them.
     Keep in sync with require_admin() below.
     """
-    return (user.get("role") or "").lower() in ADMIN_ROLE_NAMES
+    return perms.is_admin_user(user)
+
+
+def is_super_admin(user: dict) -> bool:
+    """True only for the Super Admin role.
+
+    Deliberately narrower than :func:`is_admin_role`. Super Admin is the one role
+    with no restrictions at all, so this predicate is the single switch that every
+    permission check consults. Widening it later would silently hand unrestricted
+    access to every ordinary administrator.
+    """
+    return perms.is_super_admin(user)
+
+
+def require_permission(module: str, action: str = "manage"):
+    """Build a dependency that enforces one module permission.
+
+    The shape of every authorisation decision in the app:
+
+    * Super Admin passes unconditionally -- that is what makes "no normal admin
+      restriction applies" true by construction rather than by remembering to
+      exempt each endpoint;
+    * otherwise the permission is read from the role's ``roles`` document, falling
+      back to the built-in defaults for the role;
+    * an unknown module or an unknown role grants nothing.
+
+    ``action="view"`` is satisfied by a ``manage`` grant, so a role allowed to edit
+    a module is never locked out of reading it.
+    """
+    async def _dependency(user: dict = Depends(get_current_user)) -> dict:
+        if perms.is_super_admin(user):
+            return user
+        if perms.has_permission(await perms.role_permissions(db, user.get("role")), module, action):
+            return user
+        # Backstop for the built-in administrator roles: they had access to these
+        # modules before the permission table existed, and a hand-edited role
+        # document must not be able to lock the business out of its own settings.
+        if module in ("settings", "system", "users", "admins", "roles") and is_admin_role(user):
+            return user
+        raise HTTPException(
+            status_code=403,
+            detail=f"'{module}.{action}' permission required for this action",
+        )
+    return _dependency
 
 
 async def require_admin(user: dict = Depends(get_current_user)) -> dict:
@@ -284,6 +335,15 @@ async def require_superadmin(user: dict = Depends(get_current_user)) -> dict:
     if user.get("role") not in ("superadmin", "admin"):
         raise HTTPException(status_code=403, detail="Super Admin access required")
     return user
+
+
+# Named dependencies, so an endpoint's requirement is readable at the call site
+# instead of hiding a module string inside a factory call.
+require_brand_manager = require_permission("brands", "manage")
+require_product_manager = require_permission("products", "manage")
+require_media_manager = require_permission("media", "manage")
+require_user_manager = require_permission("users", "manage")
+require_system_manager = require_permission("system", "manage")
 
 # ---------- Models ----------
 class UserCreate(BaseModel):
@@ -307,6 +367,9 @@ class UserUpdate(BaseModel):
     extension: Optional[str] = None
     allowed_brands: Optional[List[str]] = None
     password: Optional[str] = None
+    # Deactivating is the reversible counterpart to deleting: the account stops
+    # authenticating but keeps every record it created.
+    is_active: Optional[bool] = None
 
 class RoleCreate(BaseModel):
     name: str
@@ -1060,6 +1123,210 @@ def slugify(value: str) -> str:
     return s or "item"
 
 
+# ---------------------------------------------------------------------------
+# Media: brand logos and product images
+# ---------------------------------------------------------------------------
+# Reading an asset is deliberately unauthenticated. A brand logo appears on a
+# customer-facing quotation page that has no session, and every existing logo in
+# the database is already a public URL on cms.hitechavl.com. Making the stored
+# copy readable by anyone who knows the id matches that reality; the ids are
+# 64-character SHA-256 content hashes, so they are not enumerable, and nothing
+# about the CRM's data is exposed by rendering a logo.
+#
+# Writing, replacing and deleting an asset all require the media permission.
+@api.get("/media/{media_id}")
+async def get_media(media_id: str, request: Request):
+    """Serve a stored image verbatim.
+
+    The bytes are returned exactly as uploaded. Re-encoding would flatten the
+    alpha channel and put an opaque background behind every transparent logo.
+    """
+    doc = await media_store.load(db, media_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Image not found")
+    data = doc.get("data")
+    if data is None:
+        raise HTTPException(status_code=404, detail="Image not found")
+    etag = f'"{doc.get("sha256") or media_id}"'
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304)
+    return Response(
+        content=bytes(data),
+        media_type=doc.get("content_type") or "application/octet-stream",
+        headers={
+            "ETag": etag,
+            # Content-addressed: the id changes when the bytes change, so the
+            # response can be cached forever and a replaced logo is a new URL.
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Disposition": f'inline; filename="{doc.get("filename") or media_id}"',
+        },
+    )
+
+
+@api.get("/media")
+async def list_media(user: dict = Depends(require_permission("media", "view")),
+                     kind: Optional[str] = None, limit: int = 200):
+    """List stored assets (metadata only, never the bytes)."""
+    q = {"kind": kind} if kind else {}
+    rows = await db.media.find(q, {"_id": 0, "data": 0}).sort("uploaded_at", -1).to_list(min(limit, 500))
+    for r in rows:
+        r["url"] = media_store.public_url(r.get("id"))
+    return rows
+
+
+@api.post("/media", status_code=201)
+async def upload_media(file: UploadFile = File(...),
+                       kind: str = Form("image"),
+                       user: dict = Depends(require_media_manager)):
+    """Upload an image and return its id and public URL.
+
+    Rejects an unsupported type, an empty file, an oversized file and a file whose
+    header claims to be an image but cannot be decoded. Validation is by magic
+    bytes and a real decode, never by the client-supplied content type.
+    """
+    data = await file.read()
+    try:
+        doc = await media_store.store(db, data, filename=file.filename, kind=kind, actor=user)
+    except media_store.MediaError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    await audit.record(
+        db, actor=user, action=audit.UPLOAD, module=audit.MEDIA, record_type="media",
+        record_id=doc["id"], record_label=doc.get("filename"),
+        summary=f"Uploaded {doc.get('filename')} ({doc.get('width')}x{doc.get('height')}, "
+                f"{doc.get('size', 0) // 1024} KB)",
+        meta={"kind": kind, "content_type": doc.get("content_type"), "has_alpha": doc.get("has_alpha")},
+    )
+    doc["url"] = media_store.public_url(doc["id"])
+    return doc
+
+
+@api.get("/media/{media_id}/info")
+async def media_info(media_id: str):
+    """Metadata for one asset. Never the bytes -- those come from ``/media/{id}``.
+
+    Unauthenticated, like the byte route above, and for the same reason: the id *is*
+    the public URL of the image, so holding it already grants the pixels.
+    Dimensions, byte size and format are strictly less sensitive than the image
+    they describe, and a quotation page that can render a logo can describe it too.
+    Listing (``/media``) and deleting stay permission-gated, because those
+    disclose what the business holds rather than what one id resolves to.
+    """
+    doc = await media_store.metadata(db, media_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Image not found")
+    doc["url"] = media_store.public_url(media_id)
+    return doc
+
+
+@api.delete("/media/{media_id}")
+async def delete_media(media_id: str, user: dict = Depends(require_media_manager)):
+    """Delete a stored asset.
+
+    Refuses while a brand or product still points at it. Deleting the bytes out
+    from under a live reference would leave a broken logo in the catalogue, and
+    the reference is the only place the truth about "is this still needed" lives.
+    """
+    doc = await media_store.metadata(db, media_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Image not found")
+    in_use = await _media_references(media_id)
+    if in_use:
+        raise HTTPException(
+            status_code=409,
+            detail=f"This image is still used by {len(in_use)} record(s): "
+                   + ", ".join(f"{r['type']} {r['label']}" for r in in_use[:5])
+                   + ". Remove it from there first.",
+        )
+    await db.media.delete_one({"_id": media_id})
+    await audit.record(
+        db, actor=user, action=audit.DELETE, module=audit.MEDIA, record_type="media",
+        record_id=media_id, record_label=doc.get("filename"),
+        summary=f"Deleted image {doc.get('filename')}",
+    )
+    return {"ok": True, "deleted": media_id}
+
+
+async def _media_references(media_id: str) -> list:
+    """Every brand or product that still points at this asset."""
+    refs = []
+    for brand in await db.brands.find(
+        {"$or": [{"logo_media_id": media_id}, {"banner_media_id": media_id}]},
+        {"_id": 0, "name": 1, "logo_media_id": 1, "banner_media_id": 1},
+    ).to_list(200):
+        refs.append({"type": "brand", "id": brand.get("id"), "label": brand.get("name")})
+    for product in await db.products.find(
+        {"$or": [{"image_media_id": media_id}, {"product_images": media_id}, {"gallery": media_id}]},
+        {"_id": 0, "id": 1, "name": 1},
+    ).to_list(200):
+        refs.append({"type": "product", "id": product.get("id"), "label": product.get("name")})
+    return refs
+
+
+async def _read_upload(file: UploadFile, kind: str, actor: dict) -> dict:
+    """Validate and store one uploaded file, converting rejections into a 400.
+
+    Shared by the brand-logo and product-image endpoints so both apply identical
+    validation and both write an audit entry.
+    """
+    data = await file.read()
+    try:
+        return await media_store.store(db, data, filename=file.filename, kind=kind, actor=actor)
+    except media_store.MediaError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+def _resolve_media_url(doc: Optional[dict], *fields: str) -> Optional[dict]:
+    """Fill the URL fields for each media-backed field on a document.
+
+    Resolution order is deliberate: an uploaded asset wins over a legacy remote
+    ``logo_url``, because that is what "replace the logo" means to the person who
+    did it. The legacy field is left in place, so reverting is always possible.
+
+    Two URLs are published for each field. ``<field>_url`` is what a renderer
+    uses. ``<field>_media_id_url`` is keyed off the id, so a client that already
+    holds the id can build the same URL without re-deriving which field it came
+    from -- the two cannot drift apart.
+    """
+    out = dict(doc or {})
+    for field in fields:
+        media_id = out.get(f"{field}_media_id")
+        if media_id:
+            out[f"{field}_url"] = media_store.public_url(media_id)
+            out[f"{field}_media_id_url"] = media_store.public_url(media_id)
+        else:
+            out[f"{field}_url"] = out.get(field)
+            out[f"{field}_media_id_url"] = None
+    return out
+
+
+def _resolve_brand_media(brand: Optional[dict]) -> Optional[dict]:
+    """Brand with its logo/banner URLs resolved. Applied on every brand read."""
+    return _resolve_media_url(brand, "logo", "banner")
+
+
+def _resolve_product_media(product: Optional[dict]) -> Optional[dict]:
+    """Product with image URLs resolved and gallery entries expanded."""
+    out = _resolve_media_url(product, "image")
+    if out is None:
+        return None
+    # ``product_images``/``gallery`` historically held bare URLs. Entries that are
+    # media ids are expanded to their served URL so one renderer covers both.
+    for field in ("product_images", "gallery"):
+        out[field] = [media_store.public_url(e) if _looks_like_media_id(e) else e
+                      for e in (out.get(field) or [])]
+    out["image_urls"] = [u for u in ([out.get("image_url")] + list(out.get("product_images") or [])
+                                      + list(out.get("gallery") or [])) if u]
+    return out
+
+
+_MEDIA_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _looks_like_media_id(value: Any) -> bool:
+    return isinstance(value, str) and bool(_MEDIA_ID_RE.match(value))
+
+
 async def _add_config_item(config_key: str, item: dict) -> dict:
     """Shared item-creation core behind the convenience route ``POST /api/lead-sources``.
 
@@ -1154,6 +1421,10 @@ async def login(data: LoginIn, response: Response):
     # password_hash yet, and a missing key here would 500 instead of returning 401.
     if not user or not verify_password(data.password, user.get("password_hash") or ""):
         raise HTTPException(status_code=401, detail="Invalid email or password")
+    if user.get("is_active") is False:
+        raise HTTPException(
+            status_code=403,
+            detail="This account has been deactivated. Contact an administrator.")
     token = create_token(user["id"], user.get("email") or "", user.get("role") or "sales")
     response.set_cookie("access_token", token, httponly=True, samesite="lax", max_age=ACCESS_TTL_MIN * 60, path="/")
     return {
@@ -1188,10 +1459,12 @@ async def list_users(_: dict = Depends(require_admin)):
     return docs
 
 @api.post("/users", status_code=201)
-async def create_user(payload: UserCreate, _: dict = Depends(require_admin)):
+async def create_user(payload: UserCreate, user: dict = Depends(require_user_manager)):
     email = payload.email.lower()
     if await db.users.find_one({"email": email}):
         raise HTTPException(status_code=400, detail="Email already exists")
+    if payload.role not in await _known_role_names():
+        raise HTTPException(status_code=400, detail=f"Unknown role '{payload.role}'")
     new = {
         "id": str(uuid.uuid4()),
         "name": payload.name,
@@ -1203,40 +1476,147 @@ async def create_user(payload: UserCreate, _: dict = Depends(require_admin)):
         "designation": payload.designation or "Staff",
         "phone": payload.phone or "",
         "extension": payload.extension or "",
-        "allowed_brands": payload.allowed_brands or ["L-Acoustics", "DiGiCo", "RCF", "MA Lighting", "Sennheiser"],
+        # An empty allow-list means unrestricted (see _allowed_brands), so a user
+        # created without picking brands is not silently locked out of the
+        # catalogue. Restriction requires an explicit non-empty list.
+        "allowed_brands": list(payload.allowed_brands or []),
+        "is_active": True,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat()
     }
     await db.users.insert_one(new)
     new.pop("password_hash", None)
     new.pop("_id", None)
+    await audit.record(
+        db, actor=user, action=audit.CREATE, module=audit.USERS, record_type="user",
+        record_id=new["id"], record_label=f"{new['name']} <{new['email']}>",
+        summary=f"Created user {new['email']} with role {new['role']}",
+        meta={"role": new["role"], "department": new["department"]},
+    )
     return new
 
+
+async def _known_role_names() -> set:
+    names = {r["name"] for r in await db.roles.find({}, {"_id": 0, "name": 1}).to_list(200)
+             if r.get("name")}
+    names |= set(perms.DEFAULT_ROLE_PERMISSIONS)
+    names |= perms.ADMIN_ROLE_NAMES
+    return names
+
+
 @api.patch("/users/{user_id}")
-async def update_user(user_id: str, payload: UserUpdate, _: dict = Depends(require_admin)):
-    user = await db.users.find_one({"id": user_id})
-    if not user:
+async def update_user(user_id: str, payload: UserUpdate,
+                      user: dict = Depends(require_user_manager)):
+    """Update a user, including their role and whether they are active.
+
+    Two guards protect the system from a bad edit. A caller can never change their
+    own role, and only a Super Admin can grant or revoke the Super Admin role --
+    otherwise an ordinary administrator could promote themselves and then there is
+    no longer anyone who can undo it.
+    """
+    target = await db.users.find_one({"id": user_id})
+    if not target:
         raise HTTPException(status_code=404, detail="User not found")
-    
+
     updates = {}
     if payload.name is not None: updates["name"] = payload.name
     if payload.email is not None: updates["email"] = payload.email.lower()
-    if payload.role is not None: updates["role"] = payload.role
     if payload.department is not None: updates["department"] = payload.department
     if payload.designation is not None: updates["designation"] = payload.designation
     if payload.phone is not None: updates["phone"] = payload.phone
     if payload.extension is not None: updates["extension"] = payload.extension
-    if payload.allowed_brands is not None: updates["allowed_brands"] = payload.allowed_brands
+    if payload.allowed_brands is not None: updates["allowed_brands"] = list(payload.allowed_brands)
+
+    if payload.role is not None and payload.role != target.get("role"):
+        if payload.role not in await _known_role_names():
+            raise HTTPException(status_code=400, detail=f"Unknown role '{payload.role}'")
+        if user_id == user.get("id"):
+            raise HTTPException(status_code=400,
+                                detail="You cannot change your own role. Ask another Super Admin.")
+        if not is_super_admin(user) and (
+                payload.role == perms.SUPER_ADMIN_ROLE_NAME
+                or target.get("role") == perms.SUPER_ADMIN_ROLE_NAME):
+            raise HTTPException(
+                status_code=403,
+                detail="Only a Super Admin can grant or revoke the Super Admin role.")
+        updates["role"] = payload.role
+
+    if payload.is_active is not None:
+        if not is_super_admin(user) and payload.is_active is False \
+                and target.get("role") == perms.SUPER_ADMIN_ROLE_NAME:
+            raise HTTPException(status_code=403,
+                                detail="Only a Super Admin can deactivate another Super Admin.")
+        updates["is_active"] = bool(payload.is_active)
+
     if payload.password:
         updates["password_hash"] = hash_password(payload.password)
         updates["temp_password"] = payload.password
-    
+
     if updates:
         updates["updated_at"] = datetime.now(timezone.utc).isoformat()
         await db.users.update_one({"id": user_id}, {"$set": updates})
-    
+        # The password hash is never part of an audit entry.
+        await audit.record_change(
+            db, actor=user, action=audit.UPDATE, module=audit.USERS, record_type="user",
+            record_id=user_id, record_label=f"{target.get('name')} <{target.get('email')}>",
+            before=target,
+            after={**target, **updates, "password_hash": "***"},
+            fields=("name", "email", "role", "department", "designation", "phone",
+                    "extension", "allowed_brands", "is_active", "password_hash"),
+            meta={"self_edit": user_id == user.get("id")},
+        )
+
     u = await db.users.find_one({"id": user_id}, {"_id": 0, "password_hash": 0})
     return u
+
+
+@api.post("/users/{user_id}/deactivate")
+async def deactivate_user(user_id: str, user: dict = Depends(require_user_manager)):
+    """Deactivate a user without deleting their history.
+
+    Deactivation is reversible and keeps every lead, quotation and activity the
+    user created attached to them. Hard deletion would orphan all of that.
+    """
+    target = await db.users.find_one({"id": user_id}, {"_id": 0, "id": 1, "name": 1,
+                                                       "email": 1, "role": 1, "is_active": 1})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user_id == user.get("id"):
+        raise HTTPException(status_code=400, detail="You cannot deactivate your own account")
+    if not is_super_admin(user) and target.get("role") == perms.SUPER_ADMIN_ROLE_NAME:
+        raise HTTPException(status_code=403,
+                            detail="Only a Super Admin can deactivate another Super Admin")
+    now = datetime.now(timezone.utc).isoformat()
+    await db.users.update_one({"id": user_id}, {"$set": {
+        "is_active": False, "deactivated_at": now, "deactivated_by": user.get("email"),
+        "updated_at": now}})
+    await audit.record(
+        db, actor=user, action=audit.STATUS_CHANGE, module=audit.USERS, record_type="user",
+        record_id=user_id, record_label=f"{target.get('name')} <{target.get('email')}>",
+        changes=[{"field": "is_active", "before": target.get("is_active", True), "after": False,
+                  "kind": "changed"}],
+        summary=f"Deactivated user {target.get('email')}",
+    )
+    return {"ok": True, "deactivated": user_id}
+
+
+@api.post("/users/{user_id}/reactivate")
+async def reactivate_user(user_id: str, user: dict = Depends(require_user_manager)):
+    target = await db.users.find_one({"id": user_id}, {"_id": 0, "id": 1, "name": 1,
+                                                       "email": 1, "role": 1, "is_active": 1})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    now = datetime.now(timezone.utc).isoformat()
+    await db.users.update_one({"id": user_id}, {
+        "$set": {"is_active": True, "reactivated_at": now, "updated_at": now},
+        "$unset": {"deactivated_at": "", "deactivated_by": ""}})
+    await audit.record(
+        db, actor=user, action=audit.STATUS_CHANGE, module=audit.USERS, record_type="user",
+        record_id=user_id, record_label=f"{target.get('name')} <{target.get('email')}>",
+        changes=[{"field": "is_active", "before": False, "after": True, "kind": "changed"}],
+        summary=f"Reactivated user {target.get('email')}",
+    )
+    return {"ok": True, "reactivated": user_id}
 
 @api.post("/users/{user_id}/send-welcome-email")
 async def send_welcome_email(user_id: str, _: dict = Depends(require_admin)):
@@ -1305,14 +1685,52 @@ async def send_welcome_email(user_id: str, _: dict = Depends(require_admin)):
     }
 
 @api.delete("/users/{user_id}")
-async def delete_user(user_id: str, user: dict = Depends(require_admin)):
+async def delete_user(user_id: str, user: dict = Depends(require_user_manager)):
+    """Delete a user, or deactivate them when their history matters.
+
+    A user who has created records is deactivated rather than deleted. Their
+    leads, quotations and activities reference ``assigned_to``/``created_by``,
+    and deleting the row would leave those documents pointing at nobody, so the
+    history stays readable and the action stays reversible.
+    """
     target = await db.users.find_one({"id": user_id})
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
-    if target.get("role") in ("admin", "superadmin") and user.get("role") != "superadmin":
+    if target.get("role") in perms.ADMIN_ROLE_NAMES and not is_super_admin(user):
         raise HTTPException(status_code=403, detail="Only Super Admin can delete admin users")
+    if user_id == user.get("id"):
+        raise HTTPException(status_code=400, detail="You cannot delete your own account")
+
+    referenced = sum([
+        await db.leads.count_documents({"assigned_to": user_id}),
+        await db.quotations.count_documents({"created_by": user_id}),
+        await db.activities.count_documents({"user_id": user_id}),
+        await db.projects.count_documents({"created_by": user_id}),
+    ])
+    if referenced:
+        now = datetime.now(timezone.utc).isoformat()
+        await db.users.update_one({"id": user_id}, {"$set": {
+            "is_active": False, "deactivated_at": now, "deactivated_by": user.get("email"),
+            "deactivated_reason": "Deleted while owning records", "updated_at": now}})
+        await audit.record(
+            db, actor=user, action=audit.STATUS_CHANGE, module=audit.USERS,
+            record_type="user", record_id=user_id,
+            record_label=f"{target.get('name')} <{target.get('email')}>",
+            changes=[{"field": "is_active", "before": True, "after": False,
+                      "kind": "changed"}],
+            summary=f"Deactivated user {target.get('email')} instead of deleting "
+                    f"({referenced} record(s) reference them)",
+        )
+        return {"ok": True, "deleted": False, "deactivated": True,
+                "records_referencing": referenced}
+
     await db.users.delete_one({"id": user_id})
-    return {"ok": True}
+    await audit.record(
+        db, actor=user, action=audit.DELETE, module=audit.USERS, record_type="user",
+        record_id=user_id, record_label=f"{target.get('name')} <{target.get('email')}>",
+        summary=f"Deleted user {target.get('email')}",
+    )
+    return {"ok": True, "deleted": True, "deactivated": False}
 
 # ---------- Roles & Permissions ----------
 @api.get("/roles")
@@ -1342,7 +1760,7 @@ async def create_role(payload: RoleCreate, user: dict = Depends(require_superadm
     return role_doc
 
 @api.patch("/roles/{role_id}")
-async def update_role(role_id: str, payload: RoleUpdate, _: dict = Depends(require_superadmin)):
+async def update_role(role_id: str, payload: RoleUpdate, user: dict = Depends(require_superadmin)):
     role = await db.roles.find_one({"id": role_id})
     if not role:
         raise HTTPException(status_code=404, detail="Role not found")
@@ -1358,20 +1776,165 @@ async def update_role(role_id: str, payload: RoleUpdate, _: dict = Depends(requi
     if updates:
         updates["updated_at"] = datetime.now(timezone.utc).isoformat()
         await db.roles.update_one({"id": role_id}, {"$set": updates})
-    
+        if "permissions" in updates:
+            await audit.record_change(
+                db, actor=user, action=audit.UPDATE, module=audit.ROLES,
+                record_type="role", record_id=role_id, record_label=role.get("name"),
+                before=role, after={**role, **updates}, fields=("permissions",),
+                meta={"note": "permission change"},
+            )
+
     updated = await db.roles.find_one({"id": role_id}, {"_id": 0})
     return updated
 
 @api.delete("/roles/{role_id}")
-async def delete_role(role_id: str, _: dict = Depends(require_superadmin)):
+async def delete_role(role_id: str, user: dict = Depends(require_superadmin)):
     role = await db.roles.find_one({"id": role_id})
     if not role:
         raise HTTPException(status_code=404, detail="Role not found")
     if role.get("is_system"):
         raise HTTPException(status_code=400, detail="Cannot delete built-in system role")
-    
+    # A role with users attached is deactivated, not deleted: removing it would
+    # silently strip those users of every permission, which is unrecoverable
+    # without a backup and looks like the CRM broke.
+    attached = await db.users.count_documents({"role": role.get("name")})
+    if attached:
+        await db.roles.update_one({"id": role_id}, {"$set": {
+            "is_active": False,
+            "deactivated_at": datetime.now(timezone.utc).isoformat()}})
+        await audit.record(
+            db, actor=user, action=audit.STATUS_CHANGE, module=audit.ROLES,
+            record_type="role", record_id=role_id, record_label=role.get("name"),
+            changes=[{"field": "is_active", "before": True, "after": False, "kind": "changed"}],
+            summary=f"Deactivated role {role.get('name')} ({attached} user(s) attached)",
+        )
+        return {"ok": True, "deactivated": True, "users_attached": attached}
     await db.roles.delete_one({"id": role_id})
-    return {"ok": True}
+    await audit.record(
+        db, actor=user, action=audit.DELETE, module=audit.ROLES, record_type="role",
+        record_id=role_id, record_label=role.get("name"),
+        summary=f"Deleted role {role.get('name')}",
+    )
+    return {"ok": True, "deactivated": False}
+
+
+# ---------------------------------------------------------------------------
+# Permission registry
+# ---------------------------------------------------------------------------
+@api.get("/permissions")
+async def list_permissions(user: dict = Depends(get_current_user)):
+    """The module/permission vocabulary plus what the caller actually holds.
+
+    The frontend renders its Super Admin controls from this rather than from a
+    hard-coded list, so a new module cannot appear in the backend and be missing
+    from the UI's idea of what is allowed.
+    """
+    granted = await perms.user_permissions(db, user)
+    modules = []
+    for key, spec in perms.MODULES.items():
+        modules.append({
+            "key": key,
+            "label": spec["label"],
+            "actions": list(spec["actions"]),
+            "held": {a: perms.has_permission(granted, key, a) for a in spec["actions"]},
+        })
+    return {
+        "role": user.get("role"),
+        "is_super_admin": is_super_admin(user),
+        "is_admin": is_admin_role(user),
+        "permission_level": perms.FULL_ACCESS if is_super_admin(user) else None,
+        "modules": modules,
+        "granted": sorted(granted),
+    }
+
+
+@api.get("/roles/permissions")
+async def role_permission_matrix(_: dict = Depends(require_superadmin)):
+    """Every role against every module. The Super Admin role editor reads this."""
+    roles = await db.roles.find({}, {"_id": 0}).to_list(100)
+    matrix = []
+    for role in roles:
+        granted = await perms.role_permissions(db, role.get("name"))
+        matrix.append({
+            "id": role.get("id"),
+            "name": role.get("name"),
+            "display_name": role.get("display_name") or role.get("name"),
+            "description": role.get("description"),
+            "is_system": bool(role.get("is_system")),
+            "is_active": role.get("is_active", True),
+            "permission_level": role.get("permission_level"),
+            "permissions": sorted(granted),
+            "modules": {k: perms.has_permission(granted, k, "manage") for k in perms.MODULES},
+        })
+    return {"modules": [{"key": k, "label": v["label"]} for k, v in perms.MODULES.items()],
+            "roles": matrix}
+
+
+# ---------------------------------------------------------------------------
+# Audit trail
+# ---------------------------------------------------------------------------
+@api.get("/audit-logs")
+async def list_audit_logs(user: dict = Depends(require_permission("system", "view")),
+                         module: Optional[str] = None,
+                         action: Optional[str] = None,
+                         record_id: Optional[str] = None,
+                         actor_id: Optional[str] = None,
+                         record_type: Optional[str] = None,
+                         search: Optional[str] = None,
+                         limit: int = 100,
+                         skip: int = 0):
+    """The privileged-change trail, newest first.
+
+    Scoped to the system module permission: this is a record of who changed what,
+    including changes to other users, so it is not something a normal administrator
+    or a sales rep may read.
+    """
+    q: dict = {}
+    if module:
+        q["module"] = module
+    if action:
+        q["action"] = action
+    if record_id:
+        q["record_id"] = record_id
+    if actor_id:
+        q["actor_id"] = actor_id
+    if record_type:
+        q["record_type"] = record_type
+    if search:
+        term = re.escape(str(search)[:80])
+        q["$or"] = [
+            {"record_label": {"$regex": term, "$options": "i"}},
+            {"actor_name": {"$regex": term, "$options": "i"}},
+            {"summary": {"$regex": term, "$options": "i"}},
+        ]
+    rows = await db.audit_logs.find(q, {"_id": 0}).sort("created_at", -1) \
+        .skip(max(0, skip)).limit(min(limit, 500)).to_list(500)
+    total = await db.audit_logs.count_documents(q)
+    return {"entries": rows, "total": total, "limit": limit, "skip": skip}
+
+
+@api.get("/audit-logs/{entry_id}")
+async def get_audit_log(entry_id: str,
+                         _: dict = Depends(require_permission("system", "view"))):
+    entry = await db.audit_logs.find_one({"id": entry_id}, {"_id": 0})
+    if not entry:
+        raise HTTPException(status_code=404, detail="Audit entry not found")
+    return entry
+
+
+@api.get("/audit-logs/record/{record_type}/{record_id}")
+async def record_history(record_type: str, record_id: str,
+                         _: dict = Depends(require_permission("system", "view"))):
+    """Every audited change to one record, oldest first.
+
+    This is what a brand or product detail page's History tab reads: the complete
+    change trail for that one record, already ordered.
+    """
+    rows = await db.audit_logs.find(
+        {"record_id": record_id, "record_type": record_type}, {"_id": 0}) \
+        .sort("created_at", 1).to_list(200)
+    return rows
+
 
 # ---------- Leads ----------
 async def _auto_assign() -> Optional[str]:
@@ -3333,26 +3896,46 @@ def _allowed_brands(user: dict) -> Optional[List[str]]:
     explicit sentinel (a list containing no real brand is not expressible today)
     if a "sees nothing" user is ever needed.
     """
-    if user.get("role") == "admin":
+    if user.get("role") == "admin" or is_super_admin(user):
         return None
     return user.get("allowed_brands") or None
 
 @api.get("/brands")
 async def list_brands(user: dict = Depends(get_current_user),
-                      include_archived: bool = False):
+                      include_archived: bool = False,
+                      status: Optional[str] = None,
+                      search: Optional[str] = None):
     """The single canonical brand source for the whole CRM.
 
     Only the approved, active brands are returned by default: archived rows stay in
     the database so historical quotations and orders keep their meaning, but they
     never reach a dropdown, a filter or this listing. ``include_archived=true``
-    exists for administrators auditing the catalogue.
+    exists for administrators auditing the catalogue, and the brand manager uses it
+    to show every row regardless of state.
+
+    Every brand is returned with its logo and banner URLs resolved from the stored
+    upload, so a single renderer covers uploaded logos and the legacy remote ones.
     """
     q = {} if include_archived else {"status": "active", "approved": True}
+    if status:
+        q["status"] = status
+    if search:
+        # Escaped: an unescaped user string inside $regex is a ReDoS and an
+        # injection vector. Same treatment as the product search.
+        term = re.escape(str(search)[:80])
+        q["$or"] = [
+            {"name": {"$regex": term, "$options": "i"}},
+            {"brand_category": {"$regex": term, "$options": "i"}},
+            {"country": {"$regex": term, "$options": "i"}},
+        ]
     brands = await db.brands.find(q, {"_id": 0}).sort("name", 1).to_list(500)
     allowed = _allowed_brands(user)
+    out = []
     for b in brands:
+        b = _resolve_brand_media(b)
         b["locked"] = False if allowed is None else (b["name"] not in allowed)
-    return brands
+        out.append(b)
+    return out
 
 
 @api.get("/brands/{brand_id}")
@@ -3361,12 +3944,14 @@ async def get_brand(brand_id: str, user: dict = Depends(get_current_user)):
     b = await db.brands.find_one({"id": brand_id}, {"_id": 0})
     if not b:
         raise HTTPException(status_code=404, detail="Brand not found")
+    b = _resolve_brand_media(b)
     allowed = _allowed_brands(user)
     b["locked"] = False if allowed is None else (b["name"] not in allowed)
     q: dict = {"brand_id": brand_id, "status": {"$ne": "archived"}}
     if allowed is not None:
         q["brand"] = {"$in": allowed}
     b["product_count"] = await db.products.count_documents(q)
+    b["product_count_all"] = await db.products.count_documents({"brand_id": brand_id})
     # Surface the catalogue import state so an empty brand is visibly "not yet
     # imported" rather than looking like a data error. ``needs_manual_import`` is the
     # honest signal that the manufacturer's site could not be read automatically.
@@ -3379,73 +3964,231 @@ async def get_brand(brand_id: str, user: dict = Depends(get_current_user)):
         b["catalogue_imported_at"] = ci.get("imported_at")
     return b
 
+
 @api.post("/brands", status_code=201)
-async def create_brand(payload: BrandCreate, _: dict = Depends(require_admin)):
-    if await db.brands.find_one({"name": payload.name}):
+async def create_brand(payload: BrandCreate, user: dict = Depends(require_permission("brands", "manage"))):
+    """Create a brand.
+
+    The brand is created **active and approved**. The previous implementation
+    hard-coded ``approved: False``, which meant a brand added through the UI was
+    written successfully and then invisible everywhere -- it never appeared in
+    ``GET /brands``, could not be picked for a product, and looked like the save
+    had failed. The approved flag is now an explicit, editable field (see
+    ``BrandPatch``) so approval is a decision someone makes, not a side effect.
+    """
+    name = (payload.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Brand name is required")
+    if await db.brands.find_one({"name": name}):
         raise HTTPException(status_code=400, detail="Brand already exists")
+    now = datetime.now(timezone.utc).isoformat()
     p = {
         "id": str(uuid.uuid4()),
-        "name": payload.name,
-        "slug": slugify(payload.name),
+        "name": name,
+        "slug": slugify(name),
         "official_website": (payload.official_website or "").strip() or None,
         "logo_url": payload.logo_url,
+        "logo_media_id": None,
         "description": payload.description,
         "country": payload.country,
         "banner_url": payload.banner_url,
+        "banner_media_id": None,
         "brand_category": payload.brand_category,
-        "product_categories": payload.product_categories,
+        "product_categories": payload.product_categories or [],
         "featured": payload.featured,
-        "tags": payload.tags,
+        "tags": payload.tags or [],
         "status": "active",
-        "approved": False,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "approved": True,
+        "created_at": now,
+        "updated_at": now,
     }
-    await db.brands.insert_one(b)
-    b.pop("_id", None)
-    return b
+    await db.brands.insert_one(p)
+    p.pop("_id", None)
+    await audit.record(
+        db, actor=user, action=audit.CREATE, module=audit.BRANDS, record_type="brand",
+        record_id=p["id"], record_label=name,
+        summary=f"Created brand {name}",
+        meta={"website": p["official_website"], "brand_category": p["brand_category"]},
+    )
+    return _resolve_brand_media(p)
 
 
 @api.put("/brands/{brand_id}")
 async def update_brand(brand_id: str, payload: BrandCreate,
-                       _: dict = Depends(require_admin)):
-    """Update a brand's editable metadata. The name and approved flag are fixed.
+                       user: dict = Depends(require_permission("brands", "manage"))):
+    """Full replace of a brand's editable metadata.
 
-    The approved list is the business's master decision, so it is not editable
-    through the API -- otherwise the catalogue could be widened from the UI and
-    drift away from the signed-off 21.
+    Kept as PUT for backwards compatibility. ``status`` and ``approved`` are not
+    settable here: this endpoint predates the Super Admin UI and its contract is
+    "here is the whole record". Use ``PATCH /brands/{id}`` for a partial change,
+    including activating, deactivating or approving a brand.
     """
     existing = await db.brands.find_one({"id": brand_id}, {"_id": 0})
     if not existing:
         raise HTTPException(status_code=404, detail="Brand not found")
+    name = (payload.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Brand name is required")
     clash = await db.brands.find_one(
-        {"name": payload.name, "id": {"$ne": brand_id}}, {"_id": 0, "id": 1})
+        {"name": name, "id": {"$ne": brand_id}}, {"_id": 0, "id": 1})
     if clash:
         raise HTTPException(status_code=400, detail="Brand already exists")
-    await db.brands.update_one({"id": brand_id}, {"$set": {
-        "name": payload.name,
-        "slug": slugify(payload.name),
+    after = dict(existing)
+    after.update({
+        "name": name,
+        "slug": slugify(name),
         "official_website": (payload.official_website or "").strip() or None,
         "logo_url": payload.logo_url,
         "banner_url": payload.banner_url,
         "description": payload.description,
         "country": payload.country,
         "brand_category": payload.brand_category,
-        "product_categories": payload.product_categories,
+        "product_categories": payload.product_categories or [],
         "featured": payload.featured,
-        "tags": payload.tags,
+        "tags": payload.tags or [],
         "updated_at": datetime.now(timezone.utc).isoformat(),
-    }})
-    return await db.brands.find_one({"id": brand_id}, {"_id": 0})
+    })
+    await db.brands.update_one({"id": brand_id}, {
+        "$set": {k: v for k, v in after.items() if k not in ("_id", "id")},
+    })
+    await audit.record_change(
+        db, actor=user, action=audit.UPDATE, module=audit.BRANDS, record_type="brand",
+        record_id=brand_id, record_label=name, before=existing, after=after,
+        fields=("name", "official_website", "description", "country", "brand_category",
+                "product_categories", "featured", "tags", "logo_url", "banner_url"),
+    )
+    return _resolve_brand_media(await db.brands.find_one({"id": brand_id}, {"_id": 0}))
+
+
+class BrandPatch(BaseModel):
+    """Partial brand update.
+
+    Every field is optional and only what is sent is written, which is what makes
+    a status toggle a one-field request instead of a full-record round trip that
+    can silently blank a description.
+    """
+    name: Optional[str] = None
+    country: Optional[str] = None
+    description: Optional[str] = None
+    official_website: Optional[str] = None
+    logo_url: Optional[str] = None
+    logo_media_id: Optional[str] = None
+    banner_url: Optional[str] = None
+    banner_media_id: Optional[str] = None
+    brand_category: Optional[str] = None
+    product_categories: Optional[List[str]] = None
+    featured: Optional[bool] = None
+    tags: Optional[List[str]] = None
+    status: Optional[Literal["active", "inactive", "archived"]] = None
+    approved: Optional[bool] = None
+
+
+# The fields a PATCH may write, mapped to a coercion. ``logo_media_id`` is
+# intentionally absent: a logo is replaced through the upload endpoint so the
+# bytes are validated and stored atomically with the pointer.
+_BRAND_PATCHABLE = {
+    "country": str, "description": str, "official_website": str, "logo_url": str,
+    "brand_category": str, "status": str,
+}
+_BRAND_PATCHABLE_LISTS = ("product_categories", "tags")
+
+
+@api.patch("/brands/{brand_id}")
+async def patch_brand(brand_id: str, payload: BrandPatch,
+                      user: dict = Depends(require_permission("brands", "manage"))):
+    """Partially update a brand, including its status and approval.
+
+    Activating a brand sets ``status: active``; deactivating sets
+    ``status: inactive``. Only ``status: archived`` hides it from the catalogue
+    listings, so "deactivate" and "archive" are different, reversible operations.
+    """
+    existing = await db.brands.find_one({"id": brand_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Brand not found")
+
+    body = payload.model_dump(exclude_unset=True)
+    sets: dict = {}
+
+    if "name" in body and body["name"] is not None:
+        name = body["name"].strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Brand name cannot be empty")
+        clash = await db.brands.find_one({"name": name, "id": {"$ne": brand_id}}, {"_id": 0, "id": 1})
+        if clash:
+            raise HTTPException(status_code=400, detail="Brand already exists")
+        sets["name"] = name
+        sets["slug"] = slugify(name)
+
+    for field, caster in _BRAND_PATCHABLE.items():
+        if field not in body:
+            continue
+        value = body[field]
+        if field == "official_website" and isinstance(value, str):
+            value = value.strip() or None
+        sets[field] = caster(value) if value is not None else None
+
+    for field in _BRAND_PATCHABLE_LISTS:
+        if field in body and body[field] is not None:
+            sets[field] = list(body[field])
+
+    if "featured" in body and body["featured"] is not None:
+        sets["featured"] = bool(body["featured"])
+
+    # status/approved are interlocked: approving an archived brand without
+    # unarchiving it would produce a row that no listing can ever show.
+    if "status" in body and body["status"] is not None:
+        status = body["status"]
+        sets["status"] = status
+        if status == "archived":
+            sets["archived_at"] = datetime.now(timezone.utc).isoformat()
+            sets["approved"] = False
+        elif status == "active":
+            sets["approved"] = True
+            sets.pop("archived_at", None)
+            sets.pop("archive_reason", None)
+    if "approved" in body and body["approved"] is not None:
+        sets["approved"] = bool(body["approved"])
+        if sets.get("approved") and sets.get("status") in ("inactive", "archived"):
+            # Approving an archived brand: bring it back so the approval is real.
+            sets["status"] = "active"
+            sets.pop("archived_at", None)
+
+    if not sets:
+        return _resolve_brand_media(existing)
+
+    sets["updated_at"] = datetime.now(timezone.utc).isoformat()
+    await db.brands.update_one({"id": brand_id}, {"$set": sets})
+    after = await db.brands.find_one({"id": brand_id}, {"_id": 0})
+
+    status_before = existing.get("status")
+    status_after = after.get("status")
+    if status_before != status_after:
+        action = audit.ARCHIVE if status_after == "archived" else audit.STATUS_CHANGE
+        await audit.record(
+            db, actor=user, action=action, module=audit.BRANDS, record_type="brand",
+            record_id=brand_id, record_label=after.get("name"),
+            changes=[{"field": "status", "before": status_before, "after": status_after,
+                      "kind": "changed"}],
+            summary=f"Status: {status_before} -> {status_after}",
+        )
+    await audit.record_change(
+        db, actor=user, action=audit.UPDATE, module=audit.BRANDS, record_type="brand",
+        record_id=brand_id, record_label=after.get("name"), before=existing, after=after,
+        fields=("name", "official_website", "description", "country", "brand_category",
+                "product_categories", "featured", "tags", "logo_url", "banner_url",
+                "status", "approved"),
+    )
+    return _resolve_brand_media(after)
+
 
 @api.delete("/brands/{brand_id}")
-async def delete_brand(brand_id: str, _: dict = Depends(require_admin)):
+async def delete_brand(brand_id: str, user: dict = Depends(require_permission("brands", "manage"))):
     """Archive a brand. Its products are archived with it; nothing is destroyed.
 
     Quotations and purchase orders carry the brand name as free text on their line
     items, so hard-deleting a brand would leave historical documents naming a vendor
     the catalogue has never heard of. Archiving removes it from every active
-    listing while keeping the history readable.
+    listing while keeping the history readable, and ``PATCH`` brings it back.
     """
     brand = await db.brands.find_one({"id": brand_id}, {"_id": 0, "id": 1, "name": 1})
     if not brand:
@@ -3454,26 +4197,136 @@ async def delete_brand(brand_id: str, _: dict = Depends(require_admin)):
     await db.brands.update_one({"id": brand_id}, {"$set": {
         "status": "archived", "approved": False, "archived_at": now,
         "archive_reason": "Archived by administrator", "updated_at": now}})
+    # Snapshot the live products before archiving them, so the audit entry can say
+    # what was taken out of the catalogue rather than just "archived the brand".
+    affected = await db.products.find(
+        {"$or": [{"brand_id": brand_id}, {"brand": brand["name"]}],
+         "status": {"$ne": "archived"}},
+        {"_id": 0, "id": 1, "name": 1}).to_list(500)
     await db.products.update_many(
         {"$or": [{"brand_id": brand_id}, {"brand": brand["name"]}]},
         {"$set": {"status": "archived", "archived_at": now,
                   "archive_reason": "Parent brand archived", "updated_at": now}},
     )
-    return {"ok": True, "archived": brand_id}
+    await audit.record(
+        db, actor=user, action=audit.ARCHIVE, module=audit.BRANDS, record_type="brand",
+        record_id=brand_id, record_label=brand.get("name"),
+        changes=[{"field": "status", "before": "active", "after": "archived", "kind": "changed"}],
+        summary=f"Archived brand {brand.get('name')}"
+                + (f" (and {len(affected)} product(s))" if affected else ""),
+        meta={"affected_products": [p.get("id") for p in affected][:100]},
+    )
+    return {"ok": True, "archived": brand_id, "products_archived": len(affected)}
+
+
+@api.post("/brands/{brand_id}/restore")
+async def restore_brand(brand_id: str, user: dict = Depends(require_permission("brands", "manage"))):
+    """Bring an archived brand back, with its products.
+
+    Products are restored to ``active`` only if nothing suggests they were
+    retired on their own account: a product that was already archived before its
+    brand was stays archived.
+    """
+    brand = await db.brands.find_one({"id": brand_id}, {"_id": 0})
+    if not brand:
+        raise HTTPException(status_code=404, detail="Brand not found")
+    if brand.get("status") != "archived":
+        raise HTTPException(status_code=400, detail="This brand is not archived")
+    now = datetime.now(timezone.utc).isoformat()
+    await db.brands.update_one({"id": brand_id}, {"$set": {
+        "status": "active", "approved": True, "restored_at": now, "updated_at": now}})
+    await db.brands.update_one({"id": brand_id},
+                               {"$unset": {"archived_at": "", "archive_reason": ""}})
+    restored = await db.products.update_many(
+        {"$or": [{"brand_id": brand_id}, {"brand": brand.get("name")}],
+         "status": "archived", "archive_reason": "Parent brand archived"},
+        {"$set": {"status": "active", "updated_at": now},
+         "$unset": {"archived_at": "", "archive_reason": ""}},
+    )
+    await audit.record(
+        db, actor=user, action=audit.RESTORE, module=audit.BRANDS, record_type="brand",
+        record_id=brand_id, record_label=brand.get("name"),
+        changes=[{"field": "status", "before": "archived", "after": "active", "kind": "changed"}],
+        summary=f"Restored brand {brand.get('name')} "
+                f"and {restored.modified_count} product(s)",
+    )
+    return {"ok": True, "restored": brand_id, "products_restored": restored.modified_count}
+
+
+@api.post("/brands/{brand_id}/logo")
+async def upload_brand_logo(brand_id: str, file: UploadFile = File(...),
+                            user: dict = Depends(require_permission("brands", "manage"))):
+    """Upload or replace a brand's logo.
+
+    Accepts PNG, JPEG or WebP, detected from the file's own bytes. PNG is
+    recommended: its alpha channel is stored and served untouched, so a logo with
+    a transparent background stays transparent instead of gaining a white box. The
+    previous asset is kept in the media store, so replacing a logo is reversible.
+    """
+    brand = await db.brands.find_one({"id": brand_id}, {"_id": 0, "id": 1, "name": 1,
+                                                       "logo_media_id": 1, "logo_url": 1})
+    if not brand:
+        raise HTTPException(status_code=404, detail="Brand not found")
+    doc = await _read_upload(file, "brand_logo", user)
+    now = datetime.now(timezone.utc).isoformat()
+    await db.brands.update_one({"id": brand_id}, {
+        "$set": {"logo_media_id": doc["id"], "updated_at": now}})
+    replaced = brand.get("logo_media_id")
+    await audit.record(
+        db, actor=user,
+        action=audit.REPLACE if replaced else audit.UPLOAD,
+        module=audit.BRANDS, record_type="brand",
+        record_id=brand_id, record_label=brand.get("name"),
+        changes=[{"field": "logo", "before": replaced or brand.get("logo_url"),
+                  "after": media_store.public_url(doc["id"]), "kind": "changed"}],
+        summary=("Replaced" if replaced else "Uploaded") + f" logo for {brand.get('name')}",
+        meta={"media_id": doc["id"], "size": doc.get("size"),
+              "width": doc.get("width"), "height": doc.get("height"),
+              "has_alpha": doc.get("has_alpha")},
+    )
+    updated = await db.brands.find_one({"id": brand_id}, {"_id": 0})
+    return _resolve_brand_media(updated)
+
+
+@api.delete("/brands/{brand_id}/logo")
+async def remove_brand_logo(brand_id: str, user: dict = Depends(require_permission("brands", "manage"))):
+    """Remove a brand's logo.
+
+    Drops the stored pointer but keeps the bytes in the media store, so the logo
+    can be restored by re-pointing it and nothing is destroyed by a mis-click.
+    """
+    brand = await db.brands.find_one({"id": brand_id}, {"_id": 0})
+    if not brand:
+        raise HTTPException(status_code=404, detail="Brand not found")
+    now = datetime.now(timezone.utc).isoformat()
+    await db.brands.update_one({"id": brand_id}, {"$set": {
+        "logo_media_id": None, "logo_url": None, "logo_removed_at": now, "updated_at": now}})
+    await audit.record(
+        db, actor=user, action=audit.REMOVE, module=audit.BRANDS, record_type="brand",
+        record_id=brand_id, record_label=brand.get("name"),
+        changes=[{"field": "logo", "before": brand.get("logo_media_id") or brand.get("logo_url"),
+                  "after": None, "kind": "removed"}],
+        summary=f"Removed logo from {brand.get('name')}",
+    )
+    return _resolve_brand_media(await db.brands.find_one({"id": brand_id}, {"_id": 0}))
 
 @api.get("/products")
 async def list_products(user: dict = Depends(get_current_user),
                         brand: Optional[str] = None,
                         category: Optional[str] = None,
                         search: Optional[str] = None,
+                        status: Optional[str] = None,
                         include_archived: bool = False):
     """Product catalogue.
 
     Archived products -- retired models and everything that belonged to a brand
     outside the approved list -- are excluded unless an administrator explicitly
-    asks for them.
+    asks for them. ``status`` narrows to one of the product states
+    (active/discontinued/coming_soon/archived) for the product manager.
     """
     q: dict = {} if include_archived else {"status": {"$ne": "archived"}}
+    if status:
+        q["status"] = status
     if brand:
         q["brand"] = brand
     if category:
@@ -3495,7 +4348,8 @@ async def list_products(user: dict = Depends(get_current_user),
         if brand and brand not in allowed:
             return []
         q["brand"] = {"$in": allowed} if not brand else brand
-    return await db.products.find(q, {"_id": 0}).sort("name", 1).to_list(5000)
+    rows = await db.products.find(q, {"_id": 0}).sort("name", 1).to_list(5000)
+    return [_resolve_product_media(r) for r in rows]
 
 
 @api.get("/products/{product_id}")
@@ -3516,77 +4370,372 @@ async def get_product(product_id: str, user: dict = Depends(get_current_user)):
         p["brand_doc"] = await db.brands.find_one({"id": p["brand_id"]},
                                                   {"_id": 0, "id": 1, "name": 1, "slug": 1,
                                                    "official_website": 1, "logo_url": 1})
+        # Resolve the related brand's logo too, so a product card can show the
+        # brand mark without a second lookup.
+        if p["brand_doc"]:
+            p["brand_doc"] = _resolve_brand_media(p["brand_doc"])
     if p.get("category_id"):
         p["category_doc"] = await db.product_categories.find_one({"id": p["category_id"]},
                                                                  {"_id": 0, "id": 1, "name": 1,
                                                                   "slug": 1})
-    return p
+    return _resolve_product_media(p)
 
 
 @api.get("/categories")
 async def list_categories(_: dict = Depends(get_current_user),
-                          include_archived: bool = False):
-    """The product category taxonomy, with a live product count per category."""
+                          include_archived: bool = False,
+                          nested: bool = False):
+    """The product category taxonomy, with a live product count per category.
+
+    The default is a flat list, which is what every existing caller expects.
+    ``nested=true`` returns top-level categories with their subcategories attached,
+    which is the shape the Super Admin category manager renders.
+    """
     q = {} if include_archived else {"status": {"$ne": "archived"}}
     cats = await db.product_categories.find(q, {"_id": 0}).sort("name", 1).to_list(500)
     for c in cats:
         c["product_count"] = await db.products.count_documents({
             "category_id": c["id"], "status": {"$ne": "archived"}})
-    return cats
+    if not nested:
+        return cats
+    by_id = {c["id"]: c for c in cats}
+    for c in cats:
+        c["subcategories"] = sorted(
+            [v for v in cats if v.get("parent_id") == c["id"]],
+            key=lambda x: x.get("name") or "")
+    return [c for c in cats if not c.get("parent_id")]
+
+
+class CategoryCreate(BaseModel):
+    name: str
+    parent_id: Optional[str] = None
+    description: Optional[str] = None
+
+
+@api.post("/categories", status_code=201)
+async def create_category(payload: CategoryCreate,
+                          user: dict = Depends(require_permission("categories", "manage"))):
+    """Create a category, or a subcategory under an existing one.
+
+    The taxonomy is deduplicated by name at every level: creating "Loudspeakers"
+    twice must not produce two filters that differ only by a space.
+    """
+    name = (payload.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Category name is required")
+    slug = slugify(name)
+    parent = None
+    if payload.parent_id:
+        parent = await db.product_categories.find_one({"id": payload.parent_id}, {"_id": 0, "id": 1})
+        if not parent:
+            raise HTTPException(status_code=400, detail="Parent category not found")
+        if parent.get("parent_id"):
+            raise HTTPException(status_code=400,
+                                detail="Subcategories cannot be nested more than one level deep")
+    clash = await db.product_categories.find_one(
+        {"$or": [{"slug": slug}, {"name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}}]},
+        {"_id": 0, "id": 1, "name": 1})
+    if clash:
+        raise HTTPException(status_code=400, detail=f"Category '{name}' already exists")
+    doc = {
+        "id": str(uuid.uuid4()),
+        "name": name,
+        "slug": slug,
+        "parent_id": payload.parent_id,
+        "description": payload.description,
+        "status": "active",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    # insert_one mutates the document it is given by adding ``_id``; a copy is
+    # passed so the response body stays JSON-serialisable.
+    await db.product_categories.insert_one(dict(doc))
+    await audit.record(
+        db, actor=user, action=audit.CREATE, module=audit.CATEGORIES, record_type="category",
+        record_id=doc["id"], record_label=name,
+        summary=f"Created category {name}"
+                + (f" under {parent.get('name')}" if parent else ""),
+    )
+    return doc
+
+
+class CategoryPatch(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    parent_id: Optional[str] = None
+    status: Optional[Literal["active", "archived"]] = None
+
+
+@api.patch("/categories/{category_id}")
+async def patch_category(category_id: str, payload: CategoryPatch,
+                         user: dict = Depends(require_permission("categories", "manage"))):
+    existing = await db.product_categories.find_one({"id": category_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Category not found")
+    body = payload.model_dump(exclude_unset=True)
+    sets = {}
+    if body.get("name"):
+        name = body["name"].strip()
+        clash = await db.product_categories.find_one(
+            {"name": {"$regex": f"^{re.escape(name)}$", "$options": "i"},
+             "id": {"$ne": category_id}}, {"_id": 0, "id": 1})
+        if clash:
+            raise HTTPException(status_code=400, detail=f"Category '{name}' already exists")
+        sets["name"] = name
+        sets["slug"] = slugify(name)
+    if "description" in body:
+        sets["description"] = body["description"]
+    if "parent_id" in body:
+        if body["parent_id"] == category_id:
+            raise HTTPException(status_code=400, detail="A category cannot be its own parent")
+        sets["parent_id"] = body["parent_id"]
+    if body.get("status"):
+        sets["status"] = body["status"]
+    if not sets:
+        return existing
+    sets["updated_at"] = datetime.now(timezone.utc).isoformat()
+    await db.product_categories.update_one({"id": category_id}, {"$set": sets})
+    after = await db.product_categories.find_one({"id": category_id}, {"_id": 0})
+    await audit.record_change(
+        db, actor=user, action=audit.UPDATE, module=audit.CATEGORIES,
+        record_type="category", record_id=category_id, record_label=after.get("name"),
+        before=existing, after=after,
+        fields=("name", "description", "parent_id", "status"),
+    )
+    return after
+
+
+@api.delete("/categories/{category_id}")
+async def delete_category(category_id: str,
+                          user: dict = Depends(require_permission("categories", "manage"))):
+    """Archive a category, refusing while products still use it.
+
+    Products keep their ``category_id`` for history, so archiving is safe; but
+    leaving live products pointing at a hidden category makes them unreachable in
+    every filter, so the caller has to move them first.
+    """
+    existing = await db.product_categories.find_one({"id": category_id}, {"_id": 0, "id": 1, "name": 1})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Category not found")
+    used = await db.products.count_documents(
+        {"category_id": category_id, "status": {"$ne": "archived"}})
+    if used:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{used} active product(s) still use '{existing.get('name')}'. "
+                   f"Move or archive them first.")
+    await db.product_categories.update_one({"id": category_id}, {"$set": {
+        "status": "archived", "archived_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat()}})
+    await audit.record(
+        db, actor=user, action=audit.ARCHIVE, module=audit.CATEGORIES,
+        record_type="category", record_id=category_id, record_label=existing.get("name"),
+        changes=[{"field": "status", "before": "active", "after": "archived", "kind": "changed"}],
+        summary=f"Archived category {existing.get('name')}",
+    )
+    return {"ok": True, "archived": category_id}
+
+
+# ---------- Product attribute registry ----------
+class ProductAttribute(BaseModel):
+    name: str
+    label: Optional[str] = None
+    type: Literal["text", "number", "boolean", "select", "multiselect"] = "text"
+    unit: Optional[str] = None
+    options: List[str] = []
+    applies_to_categories: List[str] = []
+    status: Literal["active", "archived"] = "active"
+
+
+class ProductAttributePatch(BaseModel):
+    """Partial update for an existing attribute.
+
+    ``name`` is required on create but optional here: renaming an attribute that
+    products already reference would silently orphan those values, so a rename is
+    an explicit act and leaving the field out of a PATCH must not blank it.
+    """
+    name: Optional[str] = None
+    label: Optional[str] = None
+    type: Optional[Literal["text", "number", "boolean", "select", "multiselect"]] = None
+    unit: Optional[str] = None
+    options: Optional[List[str]] = None
+    applies_to_categories: Optional[List[str]] = None
+    status: Optional[Literal["active", "archived"]] = None
+
+
+@api.get("/product-attributes")
+async def list_product_attributes(_: dict = Depends(get_current_user),
+                                  include_archived: bool = False):
+    """The reusable attribute definitions used by product specifications."""
+    q = {} if include_archived else {"status": {"$ne": "archived"}}
+    return await db.product_attributes.find(q, {"_id": 0}).sort("label", 1).to_list(500)
+
+
+@api.post("/product-attributes", status_code=201)
+async def create_product_attribute(payload: ProductAttribute,
+                                   user: dict = Depends(require_permission("products", "manage"))):
+    name = (payload.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Attribute name is required")
+    if await db.product_attributes.find_one({"name": name}, {"_id": 0, "id": 1}):
+        raise HTTPException(status_code=400, detail=f"Attribute '{name}' already exists")
+    doc = {**payload.model_dump(), "name": name,
+           "label": payload.label or name.replace("_", " ").title(),
+           "created_at": datetime.now(timezone.utc).isoformat(),
+           "updated_at": datetime.now(timezone.utc).isoformat()}
+    doc["id"] = str(uuid.uuid4())
+    await db.product_attributes.insert_one(doc)
+    await audit.record(
+        db, actor=user, action=audit.CREATE, module=audit.PRODUCTS,
+        record_type="product_attribute", record_id=doc["id"], record_label=doc["label"],
+        summary=f"Created product attribute {doc['label']}",
+    )
+    doc.pop("_id", None)
+    return doc
+
+
+@api.patch("/product-attributes/{attribute_id}")
+async def patch_product_attribute(attribute_id: str, payload: ProductAttributePatch,
+                                  user: dict = Depends(require_permission("products", "manage"))):
+    existing = await db.product_attributes.find_one({"id": attribute_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Attribute not found")
+    body = payload.model_dump(exclude_unset=True)
+    if "name" in body:
+        name = (body["name"] or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Attribute name cannot be empty")
+        clash = await db.product_attributes.find_one(
+            {"name": name, "id": {"$ne": attribute_id}}, {"_id": 0, "id": 1})
+        if clash:
+            raise HTTPException(status_code=400, detail=f"Attribute '{name}' already exists")
+        body["name"] = name
+    sets = {k: v for k, v in body.items() if v is not None}
+    # A label is derived from the name when the caller does not supply one, so a
+    # rename never leaves the registry showing the old wording.
+    if sets.get("name") and "label" not in body:
+        sets["label"] = sets["name"].replace("_", " ").title()
+    if not sets:
+        return existing
+    sets["updated_at"] = datetime.now(timezone.utc).isoformat()
+    await db.product_attributes.update_one({"id": attribute_id}, {"$set": sets})
+    after = await db.product_attributes.find_one({"id": attribute_id}, {"_id": 0})
+    await audit.record_change(
+        db, actor=user, action=audit.UPDATE, module=audit.PRODUCTS,
+        record_type="product_attribute", record_id=attribute_id,
+        record_label=after.get("label"), before=existing, after=after,
+        fields=("name", "label", "type", "unit", "options", "applies_to_categories", "status"),
+    )
+    return after
+
+
+@api.delete("/product-attributes/{attribute_id}")
+async def delete_product_attribute(attribute_id: str,
+                                   user: dict = Depends(require_permission("products", "manage"))):
+    existing = await db.product_attributes.find_one({"id": attribute_id}, {"_id": 0, "id": 1, "label": 1})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Attribute not found")
+    await db.product_attributes.update_one({"id": attribute_id}, {"$set": {
+        "status": "archived", "updated_at": datetime.now(timezone.utc).isoformat()}})
+    await audit.record(
+        db, actor=user, action=audit.ARCHIVE, module=audit.PRODUCTS,
+        record_type="product_attribute", record_id=attribute_id,
+        record_label=existing.get("label"),
+        summary=f"Archived product attribute {existing.get('label')}",
+    )
+    return {"ok": True, "archived": attribute_id}
+
+async def _resolve_product_brand(brand_name: str, actor: dict) -> dict:
+    """Resolve a product's brand name to a brand document, or explain why not.
+
+    A product must always have a valid brand relationship, so a brand that does not
+    exist is always rejected. An archived or unapproved brand is rejected too --
+    except for Super Admin, who may record a product against a real but retired
+    brand, because that is where the unit physically is and losing that fact is
+    worse than the inconsistency.
+    """
+    name = (brand_name or "").strip()
+    brand = await db.brands.find_one({"name": name},
+                                     {"_id": 0, "id": 1, "name": 1, "status": 1, "approved": 1})
+    if brand and brand.get("status") == "active" and brand.get("approved"):
+        return brand
+    if brand and is_super_admin(actor):
+        return brand
+    raise HTTPException(
+        status_code=400,
+        detail=f"'{brand_name}' is not an approved brand. Add the brand first.",
+    )
+
+
+async def _resolve_or_create_category(category_name: Optional[str]) -> tuple:
+    """Return (category_id, canonical_name). Creates the taxonomy entry if needed."""
+    if not category_name:
+        return None, None
+    cat = await db.product_categories.find_one(
+        {"$or": [{"name": category_name}, {"slug": slugify(category_name)}]},
+        {"_id": 0, "id": 1, "name": 1})
+    if not cat:
+        cat = {"id": str(uuid.uuid4()), "name": category_name,
+               "slug": slugify(category_name),
+               "created_at": datetime.now(timezone.utc).isoformat()}
+        await db.product_categories.insert_one(dict(cat))
+    return cat["id"], cat["name"]
+
 
 @api.post("/products", status_code=201)
-async def create_product(payload: ProductCreate, _: dict = Depends(require_admin)):
-    brand_doc = await db.brands.find_one(
-        {"name": payload.brand, "status": "active", "approved": True}, {"_id": 0, "id": 1})
-    if not brand_doc:
-        raise HTTPException(
-            status_code=400,
-            detail=f"'{payload.brand}' is not an approved brand. Add the brand first.")
+async def create_product(payload: ProductCreate,
+                         user: dict = Depends(require_permission("products", "manage"))):
+    brand_doc = await _resolve_product_brand(payload.brand, user)
     if payload.sku and await db.products.find_one({"sku": payload.sku}, {"_id": 0, "id": 1}):
         raise HTTPException(status_code=400, detail=f"SKU '{payload.sku}' already exists")
 
-    cat_id = None
-    if payload.category:
-        cat = await db.product_categories.find_one(
-            {"$or": [{"name": payload.category}, {"slug": slugify(payload.category)}]},
-            {"_id": 0, "id": 1, "name": 1})
-        if not cat:
-            cat = {"id": str(uuid.uuid4()), "name": payload.category,
-                   "slug": slugify(payload.category),
-                   "created_at": datetime.now(timezone.utc).isoformat()}
-            await db.product_categories.insert_one(dict(cat))
-        cat_id = cat["id"]
-        payload_category = cat["name"]
-    else:
-        payload_category = None
+    cat_id, category_name = await _resolve_or_create_category(payload.category)
 
     p = {
         "id": str(uuid.uuid4()),
-        "brand": payload.brand,
+        "brand": brand_doc["name"],
         "brand_id": brand_doc["id"],
         "name": payload.name,
         "slug": slugify(payload.name),
         "model": payload.model,
         "model_number": (payload.model or "").strip() or None,
         "sku": (payload.sku or "").strip() or None,
-        "category": payload_category,
+        "category": category_name,
         "category_id": cat_id,
         "sub_category": payload.sub_category,
+        "product_family": payload.product_family,
+        "product_series": payload.product_series,
         "series": payload.product_series or payload.product_family or payload.sub_category,
         "unit_price": payload.unit_price,
         "msrp": payload.msrp,
         "dealer_price": payload.dealer_price,
         "distributor_price": payload.distributor_price,
-        "description": payload.description,
         "short_description": payload.short_description,
         "long_description": payload.long_description,
-        "official_url": getattr(payload, "official_url", None),
-        "image_url": getattr(payload, "image_url", None),
-        "specifications": getattr(payload, "specifications", None),
-        "features": getattr(payload, "features", None),
-        "source_url": getattr(payload, "source_url", None),
-        "last_verified_at": getattr(payload, "last_verified_at", None),
-        "status": "active",
+        # ``technical_specifications``, ``product_images``, ``gallery``,
+        # ``stock_quantity`` and ``warehouse_location`` were all in the request
+        # model and silently absent from the insert. A product created through the
+        # API therefore had no stock level to edit and no gallery to show, and the
+        # Super Admin product editor had nothing to write to.
+        "technical_specifications": payload.technical_specifications or {},
+        "product_images": list(payload.product_images or []),
+        "gallery": list(payload.gallery or []),
+        "downloads": [d.model_dump() for d in (payload.downloads or [])],
+        "accessories": list(payload.accessories or []),
+        "compatible_products": list(payload.compatible_products or []),
+        "related_products": list(payload.related_products or []),
+        "stock_quantity": payload.stock_quantity,
+        "warehouse_location": payload.warehouse_location,
+        "warranty": payload.warranty,
+        "country_of_origin": payload.country_of_origin,
+        "official_url": payload.official_url,
+        "image_url": payload.image_url,
+        "image_media_id": None,
+        "specifications": payload.specifications,
+        "features": list(payload.features or []),
+        "source_url": payload.source_url,
+        "last_verified_at": payload.last_verified_at,
+        "status": payload.status or "active",
         # An unset price is a real state, not a zero: flag it so the catalogue can
         # show "price pending" instead of displaying a confident ₹0.
         "price_status": payload.price_status or ("set" if payload.unit_price else "pending"),
@@ -3594,70 +4743,413 @@ async def create_product(payload: ProductCreate, _: dict = Depends(require_admin
     }
     await db.products.insert_one(p)
     p.pop("_id", None)
-    return p
+    await audit.record(
+        db, actor=user, action=audit.CREATE, module=audit.PRODUCTS, record_type="product",
+        record_id=p["id"], record_label=f"{brand_doc['name']} {payload.name}",
+        summary=f"Created product {payload.name} under {brand_doc['name']}",
+        meta={"sku": p["sku"], "brand_id": brand_doc["id"]},
+    )
+    return _resolve_product_media(p)
 
 
 @api.put("/products/{product_id}")
 async def update_product(product_id: str, payload: ProductCreate,
-                         _: dict = Depends(require_admin)):
+                         user: dict = Depends(require_permission("products", "manage"))):
     """Replace a product's editable fields, keeping price and provenance intact."""
     existing = await db.products.find_one({"id": product_id}, {"_id": 0})
     if not existing:
         raise HTTPException(status_code=404, detail="Product not found")
-    if payload.brand and payload.brand != existing.get("brand"):
-        brand_doc = await db.brands.find_one(
-            {"name": payload.brand, "status": "active", "approved": True},
-            {"_id": 0, "id": 1})
-        if not brand_doc:
-            raise HTTPException(status_code=400,
-                                detail=f"'{payload.brand}' is not an approved brand")
-        await db.products.update_one({"id": product_id}, {"$set": {
-            "brand": payload.brand, "brand_id": brand_doc["id"]}})
+
+    after = dict(existing)
+
+    # Brand, resolved before any write so a bad brand leaves the record untouched.
+    if payload.brand and payload.brand.strip() != (existing.get("brand") or "").strip():
+        brand_doc = await _resolve_product_brand(payload.brand, user)
+        after["brand"] = brand_doc["name"]
+        after["brand_id"] = brand_doc["id"]
+        # A dangling brand pointer is silently dropped from every query that joins
+        # on brand_id, so the previous pointer is cleared whenever the name no
+        # longer matches it.
+        after.pop("brand_unresolved", None)
+
     sku = (payload.sku or "").strip() or None
     if sku and sku != existing.get("sku"):
         clash = await db.products.find_one({"sku": sku, "id": {"$ne": product_id}},
                                            {"_id": 0, "id": 1})
         if clash:
             raise HTTPException(status_code=400, detail=f"SKU '{sku}' already exists")
-    sets = {
+
+    cat_id, category_name = await _resolve_or_create_category(payload.category)
+    after.update({
         "name": payload.name,
         "slug": slugify(payload.name),
         "model": payload.model,
         "model_number": (payload.model or "").strip() or None,
         "sku": sku,
+        "category": category_name,
+        "category_id": cat_id,
         "sub_category": payload.sub_category,
+        "product_family": payload.product_family,
+        "product_series": payload.product_series,
         "series": payload.product_series or payload.product_family or payload.sub_category,
-        "description": payload.description,
         "short_description": payload.short_description,
         "long_description": payload.long_description,
-        "official_url": getattr(payload, "official_url", None),
-        "image_url": getattr(payload, "image_url", None),
-        "specifications": getattr(payload, "specifications", None),
-        "features": getattr(payload, "features", None),
-        "source_url": getattr(payload, "source_url", None),
-        "last_verified_at": getattr(payload, "last_verified_at", None),
+        "technical_specifications": payload.technical_specifications or {},
+        "product_images": list(payload.product_images or []),
+        "gallery": list(payload.gallery or []),
+        "downloads": [d.model_dump() for d in (payload.downloads or [])],
+        "accessories": list(payload.accessories or []),
+        "compatible_products": list(payload.compatible_products or []),
+        "related_products": list(payload.related_products or []),
+        "stock_quantity": payload.stock_quantity,
+        "warehouse_location": payload.warehouse_location,
+        "warranty": payload.warranty,
+        "country_of_origin": payload.country_of_origin,
+        "official_url": payload.official_url,
+        "image_url": payload.image_url,
+        "specifications": payload.specifications,
+        "features": list(payload.features or []),
+        "source_url": payload.source_url,
+        "last_verified_at": payload.last_verified_at,
+        "status": payload.status,
         "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
+    })
     # Prices are only overwritten when the caller actually sends one, so editing a
     # description cannot silently zero a price that was entered earlier.
     for price_field in ("unit_price", "msrp", "dealer_price", "distributor_price"):
         value = getattr(payload, price_field, None)
         if value is not None:
-            sets[price_field] = value
+            after[price_field] = value
     if payload.unit_price is not None:
-        sets["price_status"] = payload.price_status or "set"
-    await db.products.update_one({"id": product_id}, {"$set": sets})
-    return await db.products.find_one({"id": product_id}, {"_id": 0})
+        after["price_status"] = payload.price_status or "set"
+
+    await db.products.update_one(
+        {"id": product_id},
+        {"$set": {k: v for k, v in after.items() if k not in ("_id", "id")}})
+    await audit.record_change(
+        db, actor=user, action=audit.UPDATE, module=audit.PRODUCTS, record_type="product",
+        record_id=product_id,
+        record_label=f"{after.get('brand')} {after.get('name')}",
+        before=existing, after=after,
+        fields=("name", "brand", "model", "sku", "category", "sub_category",
+                "unit_price", "msrp", "dealer_price", "price_status",
+                "short_description", "long_description", "technical_specifications",
+                "features", "stock_quantity", "warehouse_location", "warranty",
+                "status", "image_url"),
+    )
+    return _resolve_product_media(after)
+
+
+class ProductPatch(BaseModel):
+    """Partial product update.
+
+    Unlike PUT this never requires the caller to resend the whole record, which is
+    what makes single-field edits -- a price correction, a status change, a stock
+    count -- safe. A PUT that omits a field is a full replace and would blank it.
+    """
+    name: Optional[str] = None
+    brand: Optional[str] = None
+    model: Optional[str] = None
+    sku: Optional[str] = None
+    category: Optional[str] = None
+    sub_category: Optional[str] = None
+    product_family: Optional[str] = None
+    product_series: Optional[str] = None
+    unit_price: Optional[float] = None
+    price_status: Optional[str] = None
+    msrp: Optional[float] = None
+    dealer_price: Optional[float] = None
+    distributor_price: Optional[float] = None
+    short_description: Optional[str] = None
+    long_description: Optional[str] = None
+    technical_specifications: Optional[Dict[str, Any]] = None
+    specifications: Optional[Dict[str, Any]] = None
+    features: Optional[List[str]] = None
+    product_images: Optional[List[str]] = None
+    gallery: Optional[List[str]] = None
+    accessories: Optional[List[str]] = None
+    compatible_products: Optional[List[str]] = None
+    related_products: Optional[List[str]] = None
+    warranty: Optional[str] = None
+    country_of_origin: Optional[str] = None
+    stock_quantity: Optional[int] = None
+    warehouse_location: Optional[str] = None
+    official_url: Optional[str] = None
+    image_url: Optional[str] = None
+    image_media_id: Optional[str] = None
+    source_url: Optional[str] = None
+    status: Optional[Literal["active", "discontinued", "coming_soon", "archived"]] = None
+
+
+_PRODUCT_PATCH_NUMERIC = ("unit_price", "msrp", "dealer_price", "distributor_price",
+                          "stock_quantity")
+_PRODUCT_PATCH_TEXT = ("name", "model", "sku", "sub_category", "product_family",
+                       "product_series", "short_description", "long_description",
+                       "warranty", "country_of_origin", "warehouse_location",
+                       "official_url", "image_url", "source_url", "price_status",
+                       "status")
+_PRODUCT_PATCH_JSON = ("technical_specifications", "specifications")
+_PRODUCT_PATCH_LISTS = ("features", "product_images", "gallery", "accessories",
+                        "compatible_products", "related_products")
+
+
+async def _apply_product_patch(product_id: str, body: Dict[str, Any], user: dict,
+                               existing: dict) -> dict:
+    """Turn a validated patch body into a document update. Shared by PATCH and bulk.
+
+    Returns the updated document. Raises on a brand or SKU clash without writing.
+    """
+    after = dict(existing)
+
+    if body.get("brand") and body["brand"].strip() != (existing.get("brand") or "").strip():
+        brand_doc = await _resolve_product_brand(body["brand"], user)
+        after["brand"] = brand_doc["name"]
+        after["brand_id"] = brand_doc["id"]
+        after.pop("brand_unresolved", None)
+
+    if "sku" in body:
+        sku = (body["sku"] or "").strip() or None
+        if sku and sku != existing.get("sku"):
+            clash = await db.products.find_one({"sku": sku, "id": {"$ne": product_id}},
+                                               {"_id": 0, "id": 1})
+            if clash:
+                raise HTTPException(status_code=409,
+                                    detail=f"SKU '{sku}' is already used by another product")
+        after["sku"] = sku
+
+    if "category" in body:
+        cat_id, category_name = await _resolve_or_create_category(body["category"])
+        after["category"] = category_name
+        after["category_id"] = cat_id
+
+    for field in _PRODUCT_PATCH_TEXT:
+        if field in body:
+            value = body[field]
+            if field == "name":
+                if not value or not value.strip():
+                    raise HTTPException(status_code=400, detail="Product name cannot be empty")
+                after["slug"] = slugify(value)
+            after[field] = (value.strip() or None) if isinstance(value, str) else value
+
+    for field in _PRODUCT_PATCH_NUMERIC:
+        if field in body and body[field] is not None:
+            after[field] = body[field]
+
+    for field in _PRODUCT_PATCH_JSON:
+        if field in body and body[field] is not None:
+            after[field] = body[field]
+
+    for field in _PRODUCT_PATCH_LISTS:
+        if field in body and body[field] is not None:
+            after[field] = list(body[field])
+
+    if "image_media_id" in body:
+        after["image_media_id"] = body["image_media_id"]
+
+    # Keep the denormalised series field in step, or sorting and the catalogue
+    # filter will disagree with what the record actually says.
+    if any(f in body for f in ("product_series", "product_family", "sub_category")):
+        after["series"] = after.get("product_series") or after.get("product_family") \
+            or after.get("sub_category")
+
+    if after.get("unit_price") is not None and body.get("price_status") is None \
+            and "unit_price" in body:
+        after["price_status"] = "set"
+
+    # Archiving through PATCH goes through the same path as DELETE so the audit
+    # trail and the product status stay consistent.
+    if body.get("status") == "archived" and existing.get("status") != "archived":
+        after["archived_at"] = datetime.now(timezone.utc).isoformat()
+        after["archive_reason"] = "Archived by administrator"
+    elif existing.get("status") == "archived" and body.get("status") == "active":
+        after.pop("archived_at", None)
+        after.pop("archive_reason", None)
+
+    after["updated_at"] = datetime.now(timezone.utc).isoformat()
+    await db.products.update_one(
+        {"id": product_id},
+        {"$set": {k: v for k, v in after.items() if k not in ("_id", "id")},
+         "$unset": {k: "" for k in ("archived_at", "archive_reason") if k not in after}},
+    )
+    return after
+
+
+@api.patch("/products/{product_id}")
+async def patch_product(product_id: str, payload: ProductPatch,
+                        user: dict = Depends(require_permission("products", "manage"))):
+    """Partially update a product.
+
+    The safe path for every single-field edit, including changing the brand, the
+    price, the stock level and the status.
+    """
+    existing = await db.products.find_one({"id": product_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Product not found")
+    body = payload.model_dump(exclude_unset=True)
+    if not body:
+        return _resolve_product_media(existing)
+
+    after = await _apply_product_patch(product_id, body, user, existing)
+
+    if existing.get("status") != after.get("status"):
+        await audit.record(
+            db, actor=user,
+            action=audit.ARCHIVE if after.get("status") == "archived" else audit.STATUS_CHANGE,
+            module=audit.PRODUCTS, record_type="product", record_id=product_id,
+            record_label=f"{after.get('brand')} {after.get('name')}",
+            changes=[{"field": "status", "before": existing.get("status"),
+                      "after": after.get("status"), "kind": "changed"}],
+            summary=f"Status: {existing.get('status')} -> {after.get('status')}",
+        )
+    await audit.record_change(
+        db, actor=user, action=audit.UPDATE, module=audit.PRODUCTS, record_type="product",
+        record_id=product_id, record_label=f"{after.get('brand')} {after.get('name')}",
+        before=existing, after=after,
+        fields=("name", "brand", "model", "sku", "category", "sub_category",
+                "unit_price", "msrp", "dealer_price", "price_status",
+                "short_description", "long_description", "technical_specifications",
+                "features", "stock_quantity", "warehouse_location", "warranty",
+                "status", "image_url", "image_media_id"),
+    )
+    return _resolve_product_media(after)
+
+
+class ProductDuplicate(BaseModel):
+    name: Optional[str] = None
+
+
+@api.post("/products/{product_id}/duplicate", status_code=201)
+async def duplicate_product(product_id: str, payload: Optional[ProductDuplicate] = None,
+                            user: dict = Depends(require_permission("products", "manage"))):
+    """Copy a product into a new, independent record.
+
+    The copy gets a fresh id and, unless the caller supplies one, a fresh SKU:
+    duplicating a SKU would collide with the partial unique index on ``sku`` and,
+    more importantly, would make two physical products share one identifier.
+    """
+    source = await db.products.find_one({"id": product_id}, {"_id": 0})
+    if not source:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    brand_doc = await db.brands.find_one({"id": source.get("brand_id")}, {"_id": 0, "id": 1, "name": 1})
+    if not brand_doc:
+        # A product whose brand pointer no longer resolves must not be duplicated
+        # into another broken record.
+        raise HTTPException(
+            status_code=400,
+            detail="This product's brand no longer exists. Assign it a valid brand first.",
+        )
+
+    new_name = (payload.name if payload else None) or f"{source.get('name')} (copy)"
+    sku = None
+    if source.get("sku"):
+        sku = f"{source['sku']}-COPY"
+        suffix = 2
+        while await db.products.find_one({"sku": sku}, {"_id": 0, "id": 1}):
+            sku = f"{source['sku']}-COPY{suffix}"
+            suffix += 1
+            if suffix > 50:
+                raise HTTPException(status_code=409,
+                                    detail="Too many copies of this product already exist")
+
+    now = datetime.now(timezone.utc).isoformat()
+    copy = {
+        k: v for k, v in source.items()
+        if k not in ("_id", "id", "slug", "sku", "created_at", "updated_at",
+                     "status", "archived_at", "archive_reason", "duplicate_of")
+    }
+    copy.update({
+        "id": str(uuid.uuid4()),
+        "slug": slugify(new_name),
+        "name": new_name,
+        "sku": sku,
+        "status": "active",
+        "brand": brand_doc["name"],
+        "brand_id": brand_doc["id"],
+        "duplicate_of": product_id,
+        "created_at": now,
+        "updated_at": now,
+    })
+    await db.products.insert_one(copy)
+    copy.pop("_id", None)
+    await audit.record(
+        db, actor=user, action=audit.DUPLICATE, module=audit.PRODUCTS, record_type="product",
+        record_id=copy["id"], record_label=f"{copy['brand']} {copy['name']}",
+        changes=[{"field": "duplicate_of", "before": None, "after": source.get("name"),
+                  "kind": "added"}],
+        summary=f"Duplicated product {source.get('name')} as {new_name}",
+    )
+    return _resolve_product_media(copy)
+
+
+class ProductBulkEdit(BaseModel):
+    """Apply one change set to many products at once."""
+    product_ids: List[str]
+    brand: Optional[str] = None
+    category: Optional[str] = None
+    status: Optional[Literal["active", "discontinued", "coming_soon", "archived"]] = None
+    unit_price: Optional[float] = None
+    msrp: Optional[float] = None
+    stock_quantity: Optional[int] = None
+    warehouse_location: Optional[str] = None
+    warranty: Optional[str] = None
+    sub_category: Optional[str] = None
+    features: Optional[List[str]] = None
+
+
+@api.post("/products/bulk")
+async def bulk_edit_products(payload: ProductBulkEdit,
+                             user: dict = Depends(require_permission("products", "manage"))):
+    """Apply the same change to several products.
+
+    Reports per-record success and failure rather than aborting the whole batch:
+    a bulk price correction across 400 products must not be lost because one of
+    them has a duplicate SKU.
+    """
+    if not payload.product_ids:
+        raise HTTPException(status_code=400, detail="Select at least one product")
+    if len(payload.product_ids) > 500:
+        raise HTTPException(status_code=400, detail="Select 500 products or fewer at a time")
+
+    body = {k: v for k, v in payload.model_dump().items() if k != "product_ids"
+            and v is not None}
+    if not body:
+        raise HTTPException(status_code=400, detail="Choose at least one field to change")
+    if "sku" in body:
+        raise HTTPException(status_code=400, detail="SKU cannot be set in bulk")
+
+    updated, failed = [], []
+    for pid in payload.product_ids:
+        existing = await db.products.find_one({"id": pid}, {"_id": 0})
+        if not existing:
+            failed.append({"id": pid, "name": pid, "error": "not found"})
+            continue
+        try:
+            after = await _apply_product_patch(pid, body, user, existing)
+        except HTTPException as exc:
+            failed.append({"id": pid, "name": existing.get("name"), "error": exc.detail})
+            continue
+        updated.append(pid)
+        await audit.record_change(
+            db, actor=user, action=audit.UPDATE, module=audit.PRODUCTS, record_type="product",
+            record_id=pid, record_label=f"{after.get('brand')} {after.get('name')}",
+            before=existing, after=after, fields=tuple(body.keys()),
+            meta={"bulk": True, "batch_size": len(payload.product_ids)},
+        )
+    return {"ok": True, "updated": len(updated), "failed": failed,
+            "updated_ids": updated}
 
 
 @api.delete("/products/{product_id}")
-async def delete_product(product_id: str, _: dict = Depends(require_admin)):
+async def delete_product(product_id: str,
+                         user: dict = Depends(require_permission("products", "manage"))):
     """Archive a product, and warn about inventory that pointed at it.
 
     Inventory rows keep their ``product_id`` so stock history survives, but they are
     flagged orphaned because the product is no longer orderable.
     """
-    existing = await db.products.find_one({"id": product_id}, {"_id": 0, "id": 1})
+    existing = await db.products.find_one({"id": product_id}, {"_id": 0, "id": 1, "name": 1,
+                                                               "brand": 1, "status": 1})
     if not existing:
         raise HTTPException(status_code=404, detail="Product not found")
     now = datetime.now(timezone.utc).isoformat()
@@ -3668,7 +5160,84 @@ async def delete_product(product_id: str, _: dict = Depends(require_admin)):
     if orphaned:
         await db.inventory.update_many({"product_id": product_id},
                                       {"$set": {"orphaned": True, "updated_at": now}})
+    await audit.record(
+        db, actor=user, action=audit.ARCHIVE, module=audit.PRODUCTS, record_type="product",
+        record_id=product_id, record_label=f"{existing.get('brand')} {existing.get('name')}",
+        changes=[{"field": "status", "before": existing.get("status"), "after": "archived",
+                  "kind": "changed"}],
+        summary=f"Archived product {existing.get('name')}",
+        meta={"inventory_rows_flagged": orphaned},
+    )
     return {"ok": True, "archived": product_id, "inventory_rows_flagged": orphaned}
+
+
+@api.post("/products/{product_id}/image")
+async def upload_product_image(product_id: str, file: UploadFile = File(...),
+                               user: dict = Depends(require_permission("products", "manage")),
+                               primary: bool = True):
+    """Upload or replace a product image.
+
+    The first upload becomes the product's primary image; later ones join the
+    gallery. ``primary=true`` on a later upload promotes it.
+    """
+    product = await db.products.find_one({"id": product_id}, {"_id": 0, "id": 1, "name": 1,
+                                                             "image_media_id": 1})
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    doc = await _read_upload(file, "product_image", user)
+    now = datetime.now(timezone.utc).isoformat()
+
+    if primary or not product.get("image_media_id"):
+        await db.products.update_one({"id": product_id}, {
+            "$set": {"image_media_id": doc["id"], "updated_at": now},
+            "$addToSet": {"product_images": doc["id"]}})
+    else:
+        await db.products.update_one({"id": product_id}, {
+            "$set": {"updated_at": now}, "$addToSet": {"gallery": doc["id"]}})
+
+    await audit.record(
+        db, actor=user,
+        action=audit.REPLACE if product.get("image_media_id") else audit.UPLOAD,
+        module=audit.PRODUCTS, record_type="product", record_id=product_id,
+        record_label=product.get("name"),
+        changes=[{"field": "image", "before": product.get("image_media_id"),
+                  "after": media_store.public_url(doc["id"]), "kind": "changed"}],
+        summary=("Replaced" if product.get("image_media_id") else "Uploaded")
+                + f" image for {product.get('name')}",
+        meta={"media_id": doc["id"], "size": doc.get("size"),
+              "width": doc.get("width"), "height": doc.get("height")},
+    )
+    return _resolve_product_media(await db.products.find_one({"id": product_id}, {"_id": 0}))
+
+
+@api.delete("/products/{product_id}/image")
+async def remove_product_image(product_id: str,
+                               user: dict = Depends(require_permission("products", "manage"))):
+    """Remove a product's primary image.
+
+    Falls back to the next gallery entry rather than leaving the product with no
+    image at all when one exists.
+    """
+    product = await db.products.find_one({"id": product_id}, {"_id": 0})
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    now = datetime.now(timezone.utc).isoformat()
+    remaining = [m for m in (product.get("product_images") or [])
+                 if m != product.get("image_media_id")]
+    gallery = [g for g in (product.get("gallery") or []) if g != product.get("image_media_id")]
+    await db.products.update_one({"id": product_id}, {"$set": {
+        "image_media_id": remaining[0] if remaining else None,
+        "product_images": remaining,
+        "gallery": gallery,
+        "updated_at": now}})
+    await audit.record(
+        db, actor=user, action=audit.REMOVE, module=audit.PRODUCTS, record_type="product",
+        record_id=product_id, record_label=product.get("name"),
+        changes=[{"field": "image", "before": product.get("image_media_id"), "after": None,
+                  "kind": "removed"}],
+        summary=f"Removed image from {product.get('name')}",
+    )
+    return _resolve_product_media(await db.products.find_one({"id": product_id}, {"_id": 0}))
 
 # ---------- Package Templates ----------
 @api.get("/packages")
