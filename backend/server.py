@@ -1,9 +1,5 @@
 from dotenv import load_dotenv
-from pathlib import Path
-
-ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / ".env")
-
+from pathlib:
 import os
 import re
 import uuid
@@ -18,14 +14,24 @@ from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Respons
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.security import HTTPBearer
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
-from pydantic import BaseModel, Field, EmailStr, ConfigDict
-from io import BytesIO
-from urllib.parse import quote_plus
 
 import audit
 import media as media_store
 import permissions as perms
+
+# Import Supabase client for database operations
+from supabase import create_client, Client
+
+# Initialize Supabase client
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+try:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    logger.info("✅ Supabase client initialized successfully")
+except Exception as e:
+    logger.error(f"❌ Failed to initialize Supabase client: {e}")
+    raise RuntimeError("Could not connect to Supabase. Check your SUPABASE_URL and SUPABASE_KEY environment variables.")
 
 # ---------- Database ----------
 # The URL may arrive as DATABASE_URL (the conventional production variable name) or
