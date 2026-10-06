@@ -29,12 +29,18 @@ USER crm
 
 EXPOSE 8000
 
-# Container health: the endpoint pings MongoDB, so a green result means the API can
-# actually serve traffic, not merely that the process is alive. The first boot
-# runs every pending migration before the worker starts accepting requests, so the
-# start period is generous and a slow seed is never mistaken for a broken app.
-HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=10 \
-  CMD curl -fsS http://127.0.0.1:8000/health || exit 1
+# First boot: create the schema and import the backup before the API accepts traffic.
+# Re-running is safe (CREATE TABLE IF NOT EXISTS, and rows are skipped by _id), so a
+# redeploy refreshes nothing but tops up anything missing.
+RUN printf '%s\n' \
+  '#!/bin/sh' \
+  'set -e' \
+  'echo "Preparing the PostgreSQL schema..."' \
+  'python -m pgbootstrap || echo "WARNING: schema bootstrap failed; the API will report the error"' \
+  'exec "$@"' \
+  > /entrypoint.sh && chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
 
 # Production process. Never `uvicorn --reload`, and never the dev server.
 CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2", "--proxy-headers", "--forwarded-allow-ips", "*"]

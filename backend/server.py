@@ -1,5 +1,9 @@
 from dotenv import load_dotenv
-from pathlib:
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / ".env")
+
 import os
 import re
 import uuid
@@ -14,35 +18,39 @@ from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Respons
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.security import HTTPBearer
 from starlette.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, EmailStr, ConfigDict
+from io import BytesIO
+from urllib.parse import quote_plus
 
 import audit
 import media as media_store
 import permissions as perms
 
-# Import Supabase client for database operations
-from supabase import create_client, Client
+import asyncpg
 
-# Initialize Supabase client
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-
-try:
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-    logger.info("✅ Supabase client initialized successfully")
-except Exception as e:
-    logger.error(f"❌ Failed to initialize Supabase client: {e}")
-    raise RuntimeError("Could not connect to Supabase. Check your SUPABASE_URL and SUPABASE_KEY environment variables.")
+from pgdb import PostgresDocumentDB
 
 # ---------- Database ----------
-# The URL may arrive as DATABASE_URL (the conventional production variable name) or
-# MONGO_URL (what the existing local .env uses). Both are read so an existing
-# deployment does not break, and the connection string itself is never logged or
-# returned by any endpoint.
-mongo_url = os.environ.get("MONGO_URL") or os.environ.get("DATABASE_URL")
-if not mongo_url:
-    raise RuntimeError("Neither MONGO_URL nor DATABASE_URL is set; refusing to start.")
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ.get("DB_NAME", "hitech_crm")]
+# PostgreSQL is the system of record. pgdb.py keeps the Motor call surface intact,
+# so every endpoint below reads exactly as it did against MongoDB while the rows
+# live in Postgres jsonb.
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set; refusing to start.")
+
+# A password containing a reserved URL character (the @ in "Hitechavl@2026")
+# truncates the parsed password unless it is percent-encoded.
+if "@" in DATABASE_URL.split("://", 1)[-1]:
+    from urllib.parse import quote
+
+    _head, _, _tail = DATABASE_URL.partition("://")
+    _creds, _, _host = _tail.rpartition("@")
+    if ":" in _creds:
+        _u, _, _p = _creds.partition(":")
+        DATABASE_URL = f"{_head}://{quote(_u, safe='')}:{quote(_p, safe='')}@{_host}"
+
+_pool = None  # asyncpg pool, created during startup
+db: PostgresDocumentDB = None
 
 # ---------- Config ----------
 # JWT_SECRET is required. The development default is deliberately NOT applied here:
@@ -1113,6 +1121,10 @@ async def health():
     """
     database = "disconnected"
     try:
+        # db is bound during startup; before the pool exists the app is not ready.
+        if db is None:
+            return JSONResponse(status_code=503,
+                                content={"status": "starting", "database": database})
         await db.command("ping")
         database = "connected"
     except Exception as exc:  # noqa: BLE001 - health must never raise
@@ -8424,6 +8436,30 @@ async def reset_config(config_key: str, user: dict = Depends(require_superadmin)
 # ---------- Startup ----------
 @app.on_event("startup")
 async def on_start():
+    global _pool, db
+
+    # The pool is built here rather than at import so a temporarily unreachable
+    # database cannot crash-loop the process before the event loop exists.
+    _pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=1,
+        max_size=int(os.environ.get("DB_POOL_MAX", "10")),
+        command_timeout=30,
+    )
+    db = PostgresDocumentDB(_pool)
+    logger.info("Connected to PostgreSQL")
+
+    # Fail fast if the schema has not been applied yet: every query would otherwise
+    # error one request at a time with "relation does not exist".
+    missing = await db.fetchval(
+        "SELECT count(*) FROM information_schema.tables "
+        "WHERE table_schema = 'public' AND table_name LIKE 'c\\_%'"
+    )
+    if not missing:
+        raise RuntimeError(
+            "No c_* tables found. Run: python -m backend.pgbootstrap"
+        )
+
     from migrations import run_migrations
 
     try:
@@ -8772,7 +8808,8 @@ async def on_start():
 
 @app.on_event("shutdown")
 async def on_stop():
-    client.close()
+    if _pool is not None:
+        await _pool.close()
 
 app.include_router(api)
 

@@ -2,67 +2,43 @@
 # Hitech AVL CRM — production stack for Coolify.
 #
 # Deploy as its own Coolify project (New Resource → Application → Docker
-# Compose). It joins no existing application: its own network, its own domain,
-# its own database volume.
+# Compose).
 #
 # Request flow:
 #   Internet → Coolify (Traefik) → frontend nginx   :80  (host port 3080)
 #                              → /api/* proxied to backend :8000
-#                              → backend → mongo :27017
+#                              → backend → PostgreSQL (Supabase)
 #
 # The browser only ever talks to one origin, so no CORS preflight is involved
 # and the API never needs a public hostname. REACT_APP_BACKEND_URL therefore
 # stays empty and the frontend calls the relative path "/api".
+#
+# The database is Supabase, not a service in this file. Set DATABASE_URL to the
+# Direct connection string (session mode) from the Supabase dashboard.
 # ---------------------------------------------------------------------------
 name: hitech-avl-crm
 
 services:
-  # ---------- Database ----------
-  # Named volume: data survives container recreation, redeploy and server reboot.
-  mongo:
-    image: mongo:7
-    restart: unless-stopped
-    command: ["mongod", "--bind_ip_all"]
-    environment:
-      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME:?set in Coolify env}
-      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD:?set in Coolify env}
-    volumes:
-      - mongo-data:/data/db
-    healthcheck:
-      # mongosh must authenticate, otherwise the ping is rejected and the
-      # healthcheck never goes green.
-      test:
-        [
-          "CMD-SHELL",
-          "mongosh --quiet --username \"$$MONGO_INITDB_ROOT_USERNAME\" --password \"$$MONGO_INITDB_ROOT_PASSWORD\" --authenticationDatabase admin --eval \"db.adminCommand('ping').ok\" | grep -q 1",
-        ]
-      interval: 15s
-      timeout: 10s
-      retries: 12
-      start_period: 40s
-    # Never published to the host. Only the backend needs to reach MongoDB.
-    expose:
-      - "27017"
-
   # ---------- Backend API ----------
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
     restart: unless-stopped
-    depends_on:
-      mongo:
-        condition: service_healthy
     environment:
-      MONGO_URL: mongodb://${MONGO_INITDB_ROOT_USERNAME}:${MONGO_INITDB_ROOT_PASSWORD}@mongo:27017/?authSource=admin
-      DB_NAME: ${DB_NAME:-hitech_crm}
+      # Supabase PostgreSQL, Direct connection (session mode), URI format.
+      # A password containing '@' must arrive percent-encoded (%40); the app also
+      # re-encodes it defensively at startup.
+      DATABASE_URL: ${DATABASE_URL:?set in Coolify env}
+      DB_NAME: ${DB_NAME:-postgres}
+      DB_POOL_MAX: ${DB_POOL_MAX:-10}
       JWT_SECRET: ${JWT_SECRET:?set in Coolify env}
       ADMIN_EMAIL: ${ADMIN_EMAIL:?set in Coolify env}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set in Coolify env}
       # The browser reaches the API through the frontend's own origin, so CORS
       # stays tight. Add a second origin here only if you also publish the API
       # on its own hostname.
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3080}
       # Used to build customer-facing quotation share links.
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
       FRONTEND_URL: ${FRONTEND_URL:-}
@@ -85,6 +61,8 @@ services:
       META_APP_ID: ${META_APP_ID:-}
       META_APP_SECRET: ${META_APP_SECRET:-}
       META_PAGE_ID: ${META_PAGE_ID:-}
+    depends_on:
+      - frontend
     # Not published to the host. The frontend's nginx proxies /api/* to the
     # backend over the internal network, so the API needs no public port of its
     # own — which also avoids colliding with the ports other apps on this host
@@ -103,15 +81,9 @@ services:
         # proxies to the backend service on the internal network.
         REACT_APP_BACKEND_URL: ${REACT_APP_BACKEND_URL:-}
     restart: unless-stopped
-    depends_on:
-      - backend
     ports:
       # The single public entry point. Point the Coolify domain here.
       - "${FRONTEND_PORT:-3080}:80"
     environment:
       # Resolved into nginx.conf at container start by the image's envsubst.
       BACKEND_HOST: backend
-
-volumes:
-  mongo-data:
-    name: hitech-avl-crm-mongo-data
