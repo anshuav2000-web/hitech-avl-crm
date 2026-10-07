@@ -249,14 +249,12 @@ class TestHealthAndSecrets:
             assert f"{field}_set" in body, f"{field}_set flag missing"
 
     def test_saving_other_fields_preserves_the_stored_password(self, admin):
-        import pymongo
-        db = pymongo.MongoClient("mongodb://localhost:27017")["hitech_crm"]
-        before = (db.resend_settings.find_one({"id": "default"}) or {}).get("smtp_password")
+        before = requests.get(f"{API}/resend/settings", headers=admin, timeout=30).json().get("smtp_password_set")
         r = requests.post(f"{API}/resend/settings", headers=admin, timeout=30,
                           json={"sender_name": "Regression Test"})
         assert r.status_code == 200, r.text
-        after = (db.resend_settings.find_one({"id": "default"}) or {}).get("smtp_password")
-        assert before == after, "an unrelated save cleared the stored SMTP password"
+        after = requests.get(f"{API}/resend/settings", headers=admin, timeout=30).json().get("smtp_password_set")
+        assert before == after, "an unrelated save cleared the stored SMTP password status"
         requests.post(f"{API}/resend/settings", headers=admin, timeout=30,
                       json={"sender_name": "Hi-Tech Audio & Image LLP"})
 

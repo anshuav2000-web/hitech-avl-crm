@@ -36,17 +36,18 @@ import re
 import uuid
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-try:  # Binary arrives from bson when media.py stores an upload.
+try:  # bson.Binary may appear in legacy stored documents (media uploaded before
+    # Oct 2026). The import is fully optional: plain bytes are stored the same way.
     from bson import Binary  # type: ignore
 
     _HAS_BSON = True
-except Exception:  # pragma: no cover - pymongo is a hard dependency in practice
+except Exception:  # pragma: no cover - bson/pymongo not installed; that is fine
     Binary = None  # type: ignore
     _HAS_BSON = False
 
 try:  # The migration runner catches DuplicateKeyError to break the lease race.
     from pymongo.errors import DuplicateKeyError  # type: ignore
-except Exception:  # pragma: no cover
+except Exception:  # bson/pymongo not installed; use the local fallback
     class DuplicateKeyError(Exception):  # type: ignore
         """Raised when a write violates a unique index."""
 

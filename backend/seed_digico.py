@@ -1,13 +1,15 @@
 """One-time DiGiCo catalog import.
 Loads customer prices from the pricelist, dedupes by (brand, name, model, unit_price),
 and keeps system/package SKUs intact.
+
+Uses PostgreSQL via pgdb (PostgresDocumentDB) — no MongoDB dependency.
+Run: DATABASE_URL=postgresql://... python seed_digico.py
 """
-import os
 import asyncio
-import json
-from datetime import datetime, timezone
-from motor.motor_asyncio import AsyncIOMotorClient
 import uuid
+from datetime import datetime, timezone
+
+from _seed_db import connect_db
 
 # Hand-curated, deduped subset of the DiGiCo 2026 customer pricelist
 # (rows with null prices and obvious duplicate rows already filtered;
@@ -112,10 +114,9 @@ PRODUCTS = [
     ("KLANG:quelle XDM Breakout Box - Dante & MADI",   "X-KG-QUELLE-XDM","KLANG Breakout",          141734),
 ]
 
+
 async def main():
-    from dotenv import load_dotenv
-    load_dotenv("/app/backend/.env")
-    db = AsyncIOMotorClient(os.environ["MONGO_URL"])[os.environ["DB_NAME"]]
+    pool, db = await connect_db()
 
     # Idempotent: drop all DiGiCo products and re-seed clean
     deleted = await db.products.delete_many({"brand": "DiGiCo"})
@@ -140,5 +141,8 @@ async def main():
         })
         inserted += 1
     print(f"Inserted {inserted} DiGiCo products")
+
+    await pool.close()
+
 
 asyncio.run(main())

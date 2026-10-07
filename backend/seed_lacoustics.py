@@ -6,7 +6,7 @@ import os
 import asyncio
 import uuid
 from datetime import datetime, timezone
-from motor.motor_asyncio import AsyncIOMotorClient
+from _seed_db import connect_db
 
 # L-Acoustics K2 ecosystem (model | name | category)
 PRODUCTS = [
@@ -62,9 +62,7 @@ PACKAGES = [
 ]
 
 async def main():
-    from dotenv import load_dotenv
-    load_dotenv("/app/backend/.env")
-    db = AsyncIOMotorClient(os.environ["MONGO_URL"])[os.environ["DB_NAME"]]
+    pool, db = await connect_db()
 
     # clear L-Acoustics products + packages
     pr = await db.products.delete_many({"brand": "L-Acoustics"})
@@ -98,5 +96,6 @@ async def main():
             "created_at": datetime.now(timezone.utc).isoformat(),
         })
     print(f"Inserted {len(PACKAGES)} L-Acoustics package templates")
+    await pool.close()
 
 asyncio.run(main())

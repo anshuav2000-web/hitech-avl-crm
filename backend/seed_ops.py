@@ -4,16 +4,13 @@ import asyncio
 import uuid
 import random
 from datetime import datetime, timezone, timedelta
-from motor.motor_asyncio import AsyncIOMotorClient
-from dotenv import load_dotenv
+from _seed_db import connect_db
 
-load_dotenv("/app/backend/.env")
-db = AsyncIOMotorClient(os.environ["MONGO_URL"])[os.environ["DB_NAME"]]
 random.seed(11)
 NOW = datetime.now(timezone.utc)
 
 async def main():
-    # Clear demo entries
+    pool, db = await connect_db()
     await db.shipments.delete_many({"demo": True})
     await db.inventory.delete_many({"demo": True})
     await db.amcs.delete_many({"demo": True})
@@ -131,5 +128,6 @@ async def main():
         })
     await db.amcs.insert_many(amcs)
     print(f"Inserted {len(amcs)} AMCs")
+    await pool.close()
 
 asyncio.run(main())

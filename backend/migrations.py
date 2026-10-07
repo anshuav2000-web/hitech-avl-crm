@@ -25,8 +25,20 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from pymongo import ReturnDocument
-from pymongo.errors import DuplicateKeyError
+# ReturnDocument constants — kept so migration helper calls remain unchanged.
+# (pgdb.find_one_and_update passes the value straight through; True means
+# return the document *after* the update, which is what Motor's
+# ReturnDocument.AFTER means.)
+class ReturnDocument:
+    AFTER = True
+    BEFORE = False
+
+
+try:
+    from pymongo.errors import DuplicateKeyError  # type: ignore
+except ImportError:
+    class DuplicateKeyError(Exception):  # type: ignore
+        """Raised when a write violates a unique constraint."""
 
 # Catalogue and demo-team seeding lives in its own module because the data tables are
 # long and want their rationale documented next to them.
@@ -669,26 +681,47 @@ async def run_migrations(db, log=None) -> list[str]:
 
 
 def main() -> int:
-    """CLI entry point: ``python -m migrations``."""
+    """CLI entry point: ``python -m migrations``.
+
+    Connects to the PostgreSQL database (DATABASE_URL env var) and applies any
+    pending migrations, exactly as the FastAPI startup hook does.
+    """
     from dotenv import load_dotenv
+    import asyncpg
+    from pgdb import PostgresDocumentDB
 
     load_dotenv(ROOT_DIR / ".env")
-    # Must be the async Motor client — the migration functions are coroutines.
-    from motor.motor_asyncio import AsyncIOMotorClient
 
-    url = os.environ.get("MONGO_URL", "mongodb://localhost:27017")
-    name = os.environ.get("DB_NAME", "hitech_crm")
+    database_url = os.environ.get("DATABASE_URL", "")
+    if not database_url:
+        print(
+            "ERROR: DATABASE_URL is not set.\n"
+            "  Set it in backend/.env or the environment before running migrations.",
+            file=sys.stderr,
+        )
+        return 1
 
     async def _main():
-        client = AsyncIOMotorClient(url)
-        db = client[name]
-        print(f"Connected to {name} at {url}")
+        from urllib.parse import quote
+
+        # Percent-encode reserved characters in the password (e.g. '@').
+        url = database_url
+        if "@" in url.split("://", 1)[-1]:
+            head, _, tail = url.partition("://")
+            creds, _, hostpart = tail.rpartition("@")
+            if ":" in creds:
+                u, _, p = creds.partition(":")
+                url = f"{head}://{quote(u, safe='')}:{quote(p, safe='')}@{hostpart}"
+
+        pool = await asyncpg.create_pool(url, min_size=1, max_size=3, command_timeout=30)
+        db = PostgresDocumentDB(pool)
+        print(f"Connected to PostgreSQL")
         applied = await run_migrations(db, log=lambda m: print("  " + m))
         if applied:
             print(f"Applied {len(applied)} migration(s): {', '.join(applied)}")
         else:
             print("Database already up to date.")
-        client.close()
+        await pool.close()
 
     asyncio.run(_main())
     return 0

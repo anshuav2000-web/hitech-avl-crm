@@ -17,16 +17,18 @@ header row or at a blank totals row.
 Bundle pricing: `fixed_price_inr` is taken from column J — this is the Hi-Tech
 selling price (INR) including any bundle discount, so it overrides the
 component-sum in the quotation builder.
+
+Uses PostgreSQL via pgdb (PostgresDocumentDB) — no MongoDB dependency.
+Run: DATABASE_URL=postgresql://... python seed_digico_packages.py
 """
 import asyncio
-import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from dotenv import load_dotenv
-from motor.motor_asyncio import AsyncIOMotorClient
 from openpyxl import load_workbook
+
+from _seed_db import connect_db
 
 ROOT = Path(__file__).parent
 XLSX = ROOT / "seed_data" / "digico_pricelist_2026.xlsx"
@@ -88,8 +90,7 @@ def _read_packages():
 
 
 async def main():
-    load_dotenv(ROOT / ".env")
-    db = AsyncIOMotorClient(os.environ["MONGO_URL"])[os.environ["DB_NAME"]]
+    pool, db = await connect_db()
 
     if not XLSX.exists():
         raise SystemExit(f"Pricelist not found: {XLSX}")
@@ -119,6 +120,8 @@ async def main():
         inserted += 1
         print(f"  · {pkg['name'][:60]:<60} ₹{pkg['fixed_price_inr']:>14,.0f}  ({len(pkg['components'])} comp.)")
     print(f"\nInserted {inserted} DiGiCo packages")
+
+    await pool.close()
 
 
 if __name__ == "__main__":

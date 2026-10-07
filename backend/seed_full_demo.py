@@ -6,12 +6,9 @@ import uuid
 import random
 import bcrypt
 from datetime import datetime, timezone, timedelta
-from motor.motor_asyncio import AsyncIOMotorClient
-from dotenv import load_dotenv
+from _seed_db import connect_db
 
 sys.stdout.reconfigure(encoding="utf-8")
-load_dotenv(".env")
-db = AsyncIOMotorClient(os.environ["MONGO_URL"])[os.environ["DB_NAME"]]
 
 random.seed(42)
 NOW = datetime.now(timezone.utc)
@@ -138,6 +135,7 @@ PACKAGES = [
 ]
 
 async def main():
+    pool, db = await connect_db()
     print("=== Seeding comprehensive demo data ===")
 
     # ---------- Users ----------
@@ -384,6 +382,7 @@ async def main():
     print(f"Frontend: http://localhost:3000")
     print(f"Login: admin@hitechaudio.in / Admin@123")
     print(f"\nSales reps: {', '.join(name for name,_,_,_ in SALES_REPS)}")
+    await pool.close()
 
 if __name__ == "__main__":
     asyncio.run(main())

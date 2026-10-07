@@ -8813,27 +8813,6 @@ async def on_stop():
 
 app.include_router(api)
 
-# ---------- Static Frontend Serving (Single Container Production) ----------
-STATIC_DIR = ROOT_DIR / "static"
-if STATIC_DIR.exists():
-    from fastapi.staticfiles import StaticFiles
-    from fastapi.responses import FileResponse
-    
-    if (STATIC_DIR / "static").exists():
-        app.mount("/static", StaticFiles(directory=str(STATIC_DIR / "static")), name="static-assets")
-    
-    @app.get("/{full_path:path}")
-    async def serve_frontend(full_path: str):
-        if full_path.startswith("api/") or full_path == "health" or full_path.startswith("docs") or full_path.startswith("openapi.json") or full_path.startswith("redoc"):
-            raise HTTPException(status_code=404)
-        target = STATIC_DIR / full_path
-        if target.is_file():
-            return FileResponse(target)
-        index_file = STATIC_DIR / "index.html"
-        if index_file.is_file():
-            return FileResponse(index_file)
-        raise HTTPException(status_code=404)
-
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
@@ -8850,7 +8829,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "server:app",
         host=os.environ.get("HOST", "0.0.0.0"),
-        port=int(os.environ.get("PORT", "8001")),
+        port=int(os.environ.get("PORT", "8000")),
         reload=os.environ.get("RELOAD", "true").lower() in ("1", "true", "yes"),
     )
 

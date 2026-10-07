@@ -1,21 +1,30 @@
-"""Seed rich demo data so the dashboard shows real-looking activity."""
+"""Seed rich demo data so the dashboard shows real-looking activity.
+
+Uses PostgreSQL via pgdb (PostgresDocumentDB) — no MongoDB dependency.
+Run: DATABASE_URL=postgresql://... python seed_demo.py
+"""
 import os
 import asyncio
 import uuid
 import random
 import bcrypt
 from datetime import datetime, timezone, timedelta
-from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
 
 load_dotenv("/app/backend/.env")
-db = AsyncIOMotorClient(os.environ["MONGO_URL"])[os.environ["DB_NAME"]]
+load_dotenv()
 
 random.seed(7)
 NOW = datetime.now(timezone.utc)
 
-def iso(dt): return dt.isoformat()
-def hash_pw(p): return bcrypt.hashpw(p.encode(), bcrypt.gensalt()).decode()
+
+def iso(dt):
+    return dt.isoformat()
+
+
+def hash_pw(p):
+    return bcrypt.hashpw(p.encode(), bcrypt.gensalt()).decode()
+
 
 SALES_REPS = [
     ("Rohan Mehta",   "rohan@hitechavl.com",  "Demo@123", ["L-Acoustics", "DiGiCo"]),
@@ -55,7 +64,28 @@ STAGE_WEIGHTS = [
     ("quoted", 0.18), ("won", 0.10), ("lost", 0.07),
 ]
 
+
 async def main():
+    import asyncpg
+    from pgdb import PostgresDocumentDB
+    from urllib.parse import quote
+
+    database_url = os.environ.get("DATABASE_URL", "")
+    if not database_url:
+        raise SystemExit("DATABASE_URL is not set.")
+
+    # Percent-encode reserved chars in the password.
+    url = database_url
+    if "@" in url.split("://", 1)[-1]:
+        head, _, tail = url.partition("://")
+        creds, _, hostpart = tail.rpartition("@")
+        if ":" in creds:
+            u, _, p = creds.partition(":")
+            url = f"{head}://{quote(u, safe='')}:{quote(p, safe='')}@{hostpart}"
+
+    pool = await asyncpg.create_pool(url, min_size=1, max_size=3, command_timeout=30)
+    db = PostgresDocumentDB(pool)
+
     # Get brands list for mapping interests
     brands = [b["name"] for b in await db.brands.find({}, {"_id": 0, "name": 1}).to_list(20)]
     print(f"Found brands: {brands}")
@@ -249,5 +279,8 @@ async def main():
         await db.quotations.insert_many(qs)
     print(f"Inserted {len(qs)} demo quotations")
     print("Done.")
+
+    await pool.close()
+
 
 asyncio.run(main())

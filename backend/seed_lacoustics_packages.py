@@ -21,8 +21,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from dotenv import load_dotenv
-from motor.motor_asyncio import AsyncIOMotorClient
+from _seed_db import connect_db
 from openpyxl import load_workbook
 
 ROOT = Path(__file__).parent
@@ -72,8 +71,7 @@ def _parse_sheet(ws) -> dict:
 
 
 async def main():
-    load_dotenv(ROOT / ".env")
-    db = AsyncIOMotorClient(os.environ["MONGO_URL"])[os.environ["DB_NAME"]]
+    pool, db = await connect_db()
 
     if not XLSX.exists():
         raise SystemExit(f"Pricelist not found: {XLSX}")
@@ -108,6 +106,7 @@ async def main():
         opt_count = sum(1 for c in parsed["components"] if c.get("optional"))
         print(f"  · {sheet_name:<24} ₹{parsed['fixed_price_inr']:>15,.0f}  ({len(parsed['components'])} comp, {opt_count} optional)")
     print(f"\nInserted {inserted} L-Acoustics packages")
+    await pool.close()
 
 
 if __name__ == "__main__":

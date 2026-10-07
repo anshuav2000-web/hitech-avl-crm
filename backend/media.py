@@ -1,13 +1,13 @@
 """Upload storage for brand logos and product images.
 
-Why the bytes live in MongoDB rather than on disk:
+Why the bytes live in the database rather than on disk:
 
 * the backend container has **no volume**. Anything written to its filesystem is
   destroyed by the next deploy, which would silently blank every logo the day
   after it was uploaded;
 * a logo has to be reachable from a customer-facing quotation page, so it must be
   served by the same origin that serves the API and survive a redeploy;
-* the payloads are small (a logo is tens of KB), so MongoDB is a perfectly
+* the payloads are small (a logo is tens of KB), so the database is a perfectly
   adequate blob store here and it keeps the asset, its metadata and the row that
   references it in one transaction-adjacent place.
 
@@ -17,6 +17,10 @@ uploaded are the bytes that are served.
 
 Validation is by magic bytes plus a real decode, never by the client-supplied
 content type, which is attacker controlled and routinely wrong.
+
+Bytes are persisted in PostgreSQL JSONB as base64-encoded strings via pgdb.py's
+``_default`` serialiser and recovered by ``_revive``. No external binary wrapper
+(bson.Binary) is needed.
 """
 from __future__ import annotations
 
@@ -25,8 +29,6 @@ import io
 import re
 from datetime import datetime, timezone
 from typing import Optional, Tuple
-
-from bson import Binary
 
 # ---------------------------------------------------------------------------
 # Limits
@@ -190,7 +192,7 @@ async def store(db, data: bytes, *, filename: Optional[str], kind: str,
         "uploaded_by_name": (actor or {}).get("name"),
         "uploaded_at": _now(),
         "last_used_at": _now(),
-        "data": Binary(data),
+        "data": bytes(data),
     }
     if extra:
         doc.update(extra)
