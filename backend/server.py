@@ -8850,7 +8850,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "server:app",
         host=os.environ.get("HOST", "0.0.0.0"),
-        port=int(os.environ.get("PORT", "8000")),
+        port=int(os.environ.get("PORT", "8001")),
         reload=os.environ.get("RELOAD", "true").lower() in ("1", "true", "yes"),
     )
 
