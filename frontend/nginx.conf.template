@@ -1,60 +1,19 @@
-# Static server for the compiled React app.
-#
-# Rendered through nginx's envsubst templating at container start, so the API
-# upstream is `${BACKEND_HOST}` rather than a fixed hostname. That matters on
-# Coolify, where the backend service may be reached by a generated name.
-#
-# Two things matter here beyond serving files:
-#   1. history fallback, because the router serves /pipeline, /catalog and
-#      /projects/:id as client-side routes with no matching file on disk;
-#   2. API requests proxied to the backend, so the browser talks to one origin and
-#      no CORS preflight is involved on every call.
-
 server {
     listen 80;
+    listen [::]:80;
+
     server_name _;
+
     root /usr/share/nginx/html;
     index index.html;
 
-    # Hashed build assets are immutable and can be cached hard.
-    location /static/ {
-        expires 1y;
-        add_header Cache-Control "public, immutable";
-        try_files $uri =404;
-    }
-
-    # Never cache index.html: it references the hashed asset names, so a stale copy
-    # pins the browser to an old bundle after a deploy.
-    location = /index.html {
-        add_header Cache-Control "no-cache, no-store, must-revalidate";
-    }
-
-    # API and health endpoints go straight to the FastAPI service.
-    location /api/ {
-        proxy_pass http://${BACKEND_HOST}:8000;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_read_timeout 120s;
-        # PDF generation on a large bundle quotation is slow; do not cut it off.
-        proxy_send_timeout 120s;
-    }
-
-    location = /health {
-        proxy_pass http://${BACKEND_HOST}:8000/health;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-    }
-
-    # Client-side routing fallback.
     location / {
         try_files $uri $uri/ /index.html;
     }
 
-    # Do not advertise the server version.
-    server_tokens off;
-
-    client_max_body_size 25m;
+    location /health {
+        access_log off;
+        return 200 "healthy\n";
+        add_header Content-Type text/plain;
+    }
 }
