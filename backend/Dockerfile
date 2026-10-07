@@ -24,7 +24,17 @@ COPY . .
 
 # Run as an unprivileged user.
 RUN useradd --create-home --shell /bin/bash crm \
- && chown -R crm:crm /app
+    && chown -R crm:crm /app
+
+# Create entrypoint script while still root, then switch to crm.
+RUN printf '%s\n' \
+  '#!/bin/sh' \
+  'set -e' \
+  'echo "Preparing the PostgreSQL schema..."' \
+  'python -m pgbootstrap || echo "WARNING: schema bootstrap failed; the API will report the error"' \
+  'exec "$@"' \
+  > /entrypoint.sh && chmod +x /entrypoint.sh && chown crm:crm /entrypoint.sh
+
 USER crm
 
 EXPOSE 8000
