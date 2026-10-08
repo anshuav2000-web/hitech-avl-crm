@@ -27,6 +27,9 @@ RUN npm run build
 # ---------- runtime ----------
 FROM nginx:1.27-alpine AS runtime
 
+# Default backend host for Docker network / Coolify communication
+ENV BACKEND_HOST=backend
+
 COPY --from=build /app/build /usr/share/nginx/html
 # The template lands in nginx's templates directory, where the official image runs
 # envsubst at startup. That keeps the upstream host configurable per deployment
